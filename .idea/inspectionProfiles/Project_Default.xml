@@ -1,0 +1,22 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="geopandas" />
+          <option value="h5py" />
+          <option value="hydra-core" />
+          <option value="ipykernel" />
+          <option value="ipywidgets" />
+          <option value="isort" />
+          <option value="lightning" />
+          <option value="rioxarray" />
+          <option value="torchinfo" />
+          <option value="wandb" />
+          <option value="torchvision" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

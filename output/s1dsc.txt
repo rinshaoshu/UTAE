@@ -1,0 +1,15 @@
+china_17.nc
+kyrgyzstan1_4099.nc
+kyrgyzstan1_5625.nc
+newzealand_1251.nc
+newzealand_1993.nc
+newzealand_2076.nc
+newzealand_2655.nc
+newzealand_3478.nc
+newzealand_5057.nc
+newzealand_5128.nc
+newzealand_5139.nc
+newzealand_6051.nc
+newzealand_674.nc
+newzealand_756.nc
+newzealand_839.nc
