@@ -12,8 +12,8 @@ from utils.logger import CSVLogger
 
 # ===================== 配置区（要改直接改源码） =====================
 BATCH_SIZE = 4
-LR = 1e-4
-WEIGHT_DECAY = 1e-4
+LR = 1e-3
+WEIGHT_DECAY = 0.01
 EPOCHS = 50
 TRAIN_TXT = 'train.txt'
 VAL_TXT = 'val.txt'
@@ -23,8 +23,8 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 SAVE_DIR = './checkpoints'
 LOG_DIR = './logs'
 GRADIENT_CLIP = 1.0
-PRINT_INTERVAL = 10   # 每 N 个 batch 打印一次训练 loss
-SAVE_INTERVAL = 10    # 每 N 个 epoch 保存一次模型
+PRINT_INTERVAL = 10
+SAVE_INTERVAL = 10
 NUM_WORKERS = 4
 # ====================================================================
 
@@ -196,8 +196,14 @@ def main():
     model = UTAE(in_channels=15, num_classes=1)
 
     # 优化器 & 调度器
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,  # 1e-3
+        weight_decay=WEIGHT_DECAY  # 0.01
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
+                                                           T_max=EPOCHS)
 
     # 训练器
     trainer = SegmentationTrainer(

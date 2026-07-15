@@ -187,14 +187,14 @@ from torch.utils.data import DataLoader
 def main():
     # 创建数据集
     train_dataset = SEN12Dataset(
-        txt_path='test.txt',
+        txt_path='train.txt',
         data_dir='./data',
         json_path='norm.json',  # 直接使用你的JSON文件
         augment=True
     )
 
     val_dataset = SEN12Dataset(
-        txt_path='test.txt',
+        txt_path='train.txt',
         data_dir='./data',
         json_path='norm.json',
         augment=False
@@ -208,8 +208,8 @@ def main():
     print("=" * 50)
     print("训练集测试:")
     for data, mask in train_loader:
-        print(f'Data: {data.shape}')  # (batch, t, c, h, w)
-        print(f'Mask: {mask.shape}')  # (batch, h, w)
+        print(f'Data: {data.shape}') 
+        print(f'Mask: {mask.shape}')
         print(f'Data范围: {data.min():.2f} - {data.max():.2f}')
         print(f'Mask唯一值: {torch.unique(mask)}')
         break

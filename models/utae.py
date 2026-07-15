@@ -1,6 +1,6 @@
 """
 Taken from: https://github.com/VSainteuf/utae-paps/tree/main
-Modified to only support tensor input and output
+Modified to only support tensor input and path
 """
 
 import copy
@@ -18,8 +18,8 @@ class UTAE(nn.Module):
         ...     num_classes=1,
         ... )
         >>> x = torch.randn(2, 15, 10, 128, 128)  # [B, T, C, H, W]
-        >>> output = model(x)  # Returns [B, num_classes, H, W]
-        >>> print(output.shape)
+        >>> path = model(x)  # Returns [B, num_classes, H, W]
+        >>> print(path.shape)
         torch.Size([2, 1, 128, 128])
     """
     def __init__(
@@ -44,7 +44,7 @@ class UTAE(nn.Module):
         """
         Args:
             in_channels (int): Number of channels in the input images.
-            num_classes (int): Number of output classes.
+            num_classes (int): Number of path classes.
             encoder_widths (List[int]): Number of channels for each encoder stage.
             decoder_widths (List[int]): Number of channels for each decoder stage.
             str_conv_k (int): Kernel size of strided convolutions.
