@@ -44,8 +44,12 @@ def get_seg_loss(output, target):
     Returns:
         loss: torch.Tensor, 标量
     """
+
+    device = output.device
+    pos_weight = torch.tensor([5.0]).to(device)
+
     # BCE 损失，正样本权重为 5
-    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([5.0]))
+    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     bce_loss = bce_criterion(output, target.float())
 
     # Dice 损失，smooth=1

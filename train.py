@@ -9,7 +9,6 @@ from utils.loss import get_seg_loss
 from utils.metrics import compute_metrics
 from utils.logger import CSVLogger
 
-
 # ===================== 配置区（要改直接改源码） =====================
 BATCH_SIZE = 4
 LR = 1e-3
@@ -20,12 +19,16 @@ VAL_TXT = 'val.txt'
 DATA_DIR = './data'
 JSON_PATH = 'norm.json'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-SAVE_DIR = './checkpoints'
-LOG_DIR = './logs'
+SAVE_DIR = './checkpoints/UTAE'
+LOG_DIR = './logs/UTAE'
 GRADIENT_CLIP = 1.0
 PRINT_INTERVAL = 10
 SAVE_INTERVAL = 10
 NUM_WORKERS = 4
+PRETRAINED_PATH = 'checkpoints/best_model.pth'  # 预训练权重路径，None表示不加载
+
+
+
 # ====================================================================
 
 
@@ -37,25 +40,26 @@ class SegmentationTrainer:
     """
 
     def __init__(
-        self,
-        model,
-        train_loader,
-        val_loader,
-        criterion,
-        optimizer,
-        scheduler,
-        epochs,
-        device,
-        save_dir,
-        log_dir,
-        gradient_clip=1.0,
-        print_interval=10,
-        save_interval=10,
+            self,
+            model,
+            train_loader,
+            val_loader,
+            criterion,
+            optimizer,
+            scheduler,
+            epochs,
+            device,
+            save_dir,
+            log_dir,
+            gradient_clip=1.0,
+            print_interval=10,
+            save_interval=10,
+            pretrained_path=None,  # 新增参数
     ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.criterion = criterion          # 来自 utils/loss.py 的 get_seg_loss
+        self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.epochs = epochs
@@ -63,6 +67,7 @@ class SegmentationTrainer:
         self.gradient_clip = gradient_clip
         self.print_interval = print_interval
         self.save_interval = save_interval
+        self.pretrained_path = pretrained_path
 
         os.makedirs(save_dir, exist_ok=True)
         self.save_dir = save_dir
@@ -70,6 +75,42 @@ class SegmentationTrainer:
 
         self.best_iou = 0.0
         self.model.to(self.device)
+
+        # 加载预训练权重
+        self._load_pretrained()
+
+    def _load_pretrained(self):
+        """加载预训练权重（如果有）。"""
+        if self.pretrained_path is None:
+            print("未指定预训练权重，从头开始训练")
+            return
+
+        if not os.path.exists(self.pretrained_path):
+            print(f"警告：预训练权重文件不存在: {self.pretrained_path}，从头开始训练")
+            return
+
+        try:
+            # 加载权重
+            state_dict = torch.load(self.pretrained_path, map_location=self.device)
+
+            # 处理可能的 key 不匹配（例如模型保存时带了 'module.' 前缀）
+            if list(state_dict.keys())[0].startswith('module.'):
+                # 去掉 DataParallel 添加的 'module.' 前缀
+                state_dict = {k[7:]: v for k, v in state_dict.items()}
+
+            # 加载权重，忽略不匹配的 key（例如分类头尺寸不同）
+            missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+
+            if missing_keys:
+                print(f"警告：以下权重层未从预训练模型中加载: {missing_keys}")
+            if unexpected_keys:
+                print(f"警告：预训练模型中有以下额外权重层: {unexpected_keys}")
+
+            print(f"✓ 成功加载预训练权重: {self.pretrained_path}")
+
+        except Exception as e:
+            print(f"✗ 加载预训练权重失败: {e}")
+            print("继续从头开始训练")
 
     def _train_one_epoch(self, epoch):
         """训练一个 epoch，返回平均 train_loss。"""
@@ -79,11 +120,11 @@ class SegmentationTrainer:
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.epochs} [Train]')
         for batch_idx, (data, mask) in enumerate(pbar):
-            data = data.to(self.device)       # (b, t, c, h, w)
-            mask = mask.to(self.device)       # (b, 1, h, w)
+            data = data.to(self.device)
+            mask = mask.to(self.device)
 
             self.optimizer.zero_grad()
-            output = self.model(data)         # (b, 1, h, w)
+            output = self.model(data)
             loss = self.criterion(output, mask)
             loss.backward()
 
@@ -106,7 +147,6 @@ class SegmentationTrainer:
         total_loss = 0.0
         total_batches = len(self.val_loader)
 
-        # 累积整个验证集的所有预测和目标（用于全局计算指标）
         all_outputs = []
         all_masks = []
 
@@ -123,9 +163,8 @@ class SegmentationTrainer:
 
         avg_loss = total_loss / total_batches
 
-        # 拼接所有 batch，一次性计算全局指标
-        all_outputs = torch.cat(all_outputs, dim=0)  # (N, 1, h, w)
-        all_masks = torch.cat(all_masks, dim=0)       # (N, 1, h, w)
+        all_outputs = torch.cat(all_outputs, dim=0)
+        all_masks = torch.cat(all_masks, dim=0)
         metrics = compute_metrics(all_outputs, all_masks)
 
         return avg_loss, metrics
@@ -133,16 +172,10 @@ class SegmentationTrainer:
     def train(self):
         """完整训练流程。"""
         for epoch in range(1, self.epochs + 1):
-            # 训练
             train_loss = self._train_one_epoch(epoch)
-
-            # 验证
             val_loss, metrics = self._validate()
-
-            # 调度器 step
             self.scheduler.step()
 
-            # 记录日志
             self.logger.log_epoch(epoch, train_loss, val_loss, metrics)
             print(
                 f'Epoch {epoch:3d}/{self.epochs} | '
@@ -154,14 +187,12 @@ class SegmentationTrainer:
                 f'Recall: {metrics["recall"]:.4f}'
             )
 
-            # 保存最佳模型（以 IoU 为标准）
             if metrics['iou'] > self.best_iou:
                 self.best_iou = metrics['iou']
                 best_path = os.path.join(self.save_dir, 'best_model.pth')
                 torch.save(self.model.state_dict(), best_path)
                 print(f'  → 新最佳 IoU: {self.best_iou:.4f}，已保存 {best_path}')
 
-            # 定期保存
             if epoch % self.save_interval == 0:
                 ckpt_path = os.path.join(self.save_dir, f'epoch_{epoch}.pth')
                 torch.save(self.model.state_dict(), ckpt_path)
@@ -198,8 +229,8 @@ def main():
     # 优化器 & 调度器
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LR,  # 1e-3
-        weight_decay=WEIGHT_DECAY  # 0.01
+        lr=LR,
+        weight_decay=WEIGHT_DECAY
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
@@ -220,6 +251,7 @@ def main():
         gradient_clip=GRADIENT_CLIP,
         print_interval=PRINT_INTERVAL,
         save_interval=SAVE_INTERVAL,
+        pretrained_path=PRETRAINED_PATH,  # 传入预训练路径
     )
     trainer.train()
 

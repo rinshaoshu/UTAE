@@ -24,13 +24,13 @@ group2 = lines[n1:n1+n2]
 group3 = lines[n1+n2:]
 
 # 输出三个文件
-with open('train.txt', 'w', encoding='utf-8') as f:
+with open('../train.txt', 'w', encoding='utf-8') as f:
     f.writelines(group1)
 
-with open('val.txt', 'w', encoding='utf-8') as f:
+with open('../val.txt', 'w', encoding='utf-8') as f:
     f.writelines(group2)
 
-with open('test.txt', 'w', encoding='utf-8') as f:
+with open('../test.txt', 'w', encoding='utf-8') as f:
     f.writelines(group3)
 
 # 显示结果

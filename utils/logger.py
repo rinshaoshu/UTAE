@@ -14,7 +14,7 @@ class CSVLogger:
             log_dir: str, 日志保存目录
         """
         os.makedirs(log_dir, exist_ok=True)
-        self.csv_path = os.path.join(log_dir, 'metrics.csv')
+        self.csv_path = os.path.join(log_dir, 'UTAE-metrics.csv')
 
         with open(self.csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
