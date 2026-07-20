@@ -5,6 +5,10 @@ from tqdm import tqdm
 
 from dataset import SEN12Dataset
 from models.utae import UTAE
+from models.swinutae import SwinUNetHeadWithTemporal
+from models.CMXSegTemporal import CMXSeg
+from models.CMNextSegTemporal import CMNextSeg
+
 from utils.loss import get_seg_loss
 from utils.metrics import compute_metrics
 from utils.logger import CSVLogger
@@ -19,8 +23,8 @@ VAL_TXT = 'val.txt'
 DATA_DIR = './data'
 JSON_PATH = 'norm.json'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-SAVE_DIR = './checkpoints/UTAE'
-LOG_DIR = './logs/UTAE'
+SAVE_DIR = './checkpoints/CMNextSeg'
+LOG_DIR = './logs/CMNextSeg'
 GRADIENT_CLIP = 1.0
 PRINT_INTERVAL = 10
 SAVE_INTERVAL = 10
@@ -224,7 +228,7 @@ def main():
     )
 
     # 模型
-    model = UTAE(in_channels=15, num_classes=1)
+    model = CMNextSeg(num_classes=1, img_size=128, drop_path_rate=0.1)
 
     # 优化器 & 调度器
     optimizer = torch.optim.AdamW(
@@ -251,7 +255,7 @@ def main():
         gradient_clip=GRADIENT_CLIP,
         print_interval=PRINT_INTERVAL,
         save_interval=SAVE_INTERVAL,
-        pretrained_path=PRETRAINED_PATH,  # 传入预训练路径
+        pretrained_path=None,  # 传入预训练路径
     )
     trainer.train()
 

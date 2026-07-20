@@ -1,1 +1,1 @@
-#UTAE,opticalonlyUTAE,convgru,Input Dropout，AnySeg,CMNeXt， MMANet
+#UTAE,convgru,unet3d,swinUTAE,ESANet, ACNet，（Dformer），CMNeXt
