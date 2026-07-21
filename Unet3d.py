@@ -78,12 +78,9 @@ class UNet3D(nn.Module):
 
         feats = 16
         self.en3 = conv_block(self.in_channels, feats * 4, feats * 4)
-        # 只在空间维度(H,W)下采样，保留T维度避免T=1时归零
-        self.pool_3 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=0)
-
+        self.pool_3 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
         self.en4 = conv_block(feats * 4, feats * 8, feats * 8)
-        self.pool_4 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=0)
-
+        self.pool_4 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
 
         self.center_in = center_in(feats * 8, feats * 16)
         self.center_out = center_out(feats * 16, feats * 8)
@@ -170,7 +167,6 @@ if __name__ == "__main__":
     # 前向传播
     output = model(x)
 
-    print("[TEST PASSED]")  # 改为纯文本，去掉特殊符号
-    print(f"  Input shape:  {x.shape}")      # [4, 15, 10, 128, 128]
-    print(f"  Output shape: {output.shape}")  # [4, 1, 128, 128]
-    print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"✓ Test passed")
+    print(f"  Input:  {x.shape}")      # [4, 15, 10, 128, 128]
+    print(f"  Output: {output.shape}")  # [4, 1, 128, 128]
