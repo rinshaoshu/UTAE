@@ -1,6 +1,8 @@
 """
 test0001.py — 所有模型各跑 3 个 training batch，验证 forward/loss/backward 全流程
 """
+import os
+import sys
 import torch
 from torch.utils.data import DataLoader, Subset
 
@@ -16,6 +18,51 @@ DATA_DIR = './data'
 JSON_PATH = 'norm.json'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # =================================================
+
+
+def env_check():
+    """环境自检：Python / PyTorch / CUDA / 关键文件。"""
+    print(f"{'='*55}")
+    print("环境自检")
+    print(f"{'='*55}")
+    print(f"  Python:    {sys.version}")
+    print(f"  PyTorch:   {torch.__version__}")
+    print(f"  CUDA 可用:  {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"  CUDA 版本:  {torch.version.cuda}")
+        print(f"  cuDNN:      {torch.backends.cudnn.version()}")
+        print(f"  GPU:        {torch.cuda.get_device_name(0)}")
+        print(f"  GPU 显存:   {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
+    print(f"  工作目录:   {os.getcwd()}")
+
+    # 关键数据文件
+    files = [
+        TRAIN_TXT, JSON_PATH,
+        os.path.join(DATA_DIR, 'data'),
+    ]
+    for f in files:
+        ok = "✓" if os.path.exists(f) else "✗"
+        print(f"  {ok} {f}")
+
+    # 模型文件存在性
+    model_files = [
+        'models/utae.py',
+        'models/swinutae.py',
+        'models/convgru.py',
+        'models/Unet3d.py',
+        'models/CMXSegTemporal.py',
+        'models/CMNextSegTemporal.py',
+        'models/ESASegTemporal.py',
+        'models/DSTUtea.py',
+        'dataset.py',
+        'utils/loss.py',
+        'utils/metrics.py',
+    ]
+    for f in model_files:
+        ok = "✓" if os.path.exists(f) else "✗"
+        print(f"  {ok} {f}")
+
+    print(f"{'='*55}\n")
 
 
 def build_model(name):
@@ -93,6 +140,7 @@ def train_3batches(name, model, loader_iter):
 
 
 def main():
+    env_check()
     print(f"设备: {DEVICE}")
     print(f"每个模型跑 {NUM_BATCHES} 个 training batch, batch_size={BATCH_SIZE}\n")
 
