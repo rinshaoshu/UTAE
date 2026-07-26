@@ -243,7 +243,7 @@ class SwinUNetHeadWithTemporal(nn.Module):
         img_size: int = 128,
         in_channels: int = 96,
         depths: List[int] = [2, 2, 6, 2],
-        num_classes: int = 1,
+        num_classes: int = 2,
         decoder_channels: List[int] = [256, 128, 64],   # 长度 = num_stages-1
         temporal_n_head: int = 16,
         temporal_d_model: int = 256,
@@ -406,7 +406,7 @@ if __name__ == "__main__":
         img_size=128,
         in_channels=96,
         depths=[2, 2, 6, 2],
-        num_classes=1,
+        num_classes=2,
         decoder_channels=[256, 128, 64],   # 长度 = 3（num_stages-1）
         temporal_n_head=16,
         temporal_d_model=256,

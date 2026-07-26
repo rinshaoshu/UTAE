@@ -5,8 +5,6 @@ import numpy as np
 import os
 import json
 
-
-
 class SEN12Dataset(Dataset):
     def __init__(self, txt_path, data_dir=None, json_path=None, augment=False):
         self.txt_path = txt_path
@@ -34,7 +32,6 @@ class SEN12Dataset(Dataset):
         if json_path and os.path.exists(json_path):
             with open(json_path, 'r') as f:
                 stats = json.load(f)
-            # 修改1: 直接从顶层读取 mean 和 std
             self.mean = torch.tensor([stats['mean'][band] for band in self.all_bands])
             self.std = torch.tensor([stats['std'][band] for band in self.all_bands])
             print(f"加载统计量成功，总波段数: {len(self.all_bands)}")
@@ -61,7 +58,6 @@ class SEN12Dataset(Dataset):
 
         all_exist = all(file_exists)
 
-        # ========== 新增：统一的mask提取函数 ==========
         def extract_mask(ds, config):
             """从数据集中提取mask的通用函数"""
             if 'MASK' in ds:
@@ -83,8 +79,7 @@ class SEN12Dataset(Dataset):
                     for _ in config['bands']:
                         channel_valid.append(True)
 
-                    # ========== 修改：从任何存在的文件夹提取mask ==========
-                    if mask is None:  # 如果还没有mask，尝试提取
+                    if mask is None:
                         mask = extract_mask(ds, config)
 
             data = torch.cat(all_data, dim=1)
@@ -96,7 +91,6 @@ class SEN12Dataset(Dataset):
             h, w = 256, 256
             t = 1
 
-            # 获取尺寸和mask（按优先级：s2 > dsc > asc）
             for i, config in enumerate(self.bands_config):
                 if file_exists[i]:
                     file_path = os.path.join(self.data_dir, config['dir'], self.file_list[idx])
@@ -110,7 +104,6 @@ class SEN12Dataset(Dataset):
                                 elif len(data_shape) == 2:
                                     h, w = data_shape
 
-                            # ========== 修改：从存在的文件中提取mask ==========
                             if mask is None:
                                 mask = extract_mask(ds, config)
                             break
@@ -141,13 +134,11 @@ class SEN12Dataset(Dataset):
                             for ch in range(start_ch, end_ch):
                                 channel_valid[ch] = True
 
-                            # ========== 修改：从存在的文件中提取mask ==========
                             if mask is None:
                                 mask = extract_mask(ds, config)
                     except Exception as e:
                         print(f"警告: 加载 {file_path} 失败: {e}")
 
-            # 如果还是没有mask，创建全1
             if mask is None:
                 mask = torch.ones((h, w), dtype=torch.long)
 
@@ -162,10 +153,28 @@ class SEN12Dataset(Dataset):
         if self.augment and mask is not None:
             data, mask = self._augment(data, mask)
 
-        # mask: (h, w) → (1, h, w)，DataLoader batch 后为 (b, 1, h, w)
-        mask = mask.unsqueeze(0)
+        # ========== 关键修改：将mask转换为B×C×H×W格式 (one-hot编码) ==========
+        # 原始mask: (H, W) 或 (1, H, W)，值为0或1
+        # 转换为: (2, H, W) 其中通道0是无效区域，通道1是有效区域
+        
+        # 确保mask是2D (H, W)
+        if mask.dim() == 3 and mask.shape[0] == 1:
+            mask = mask.squeeze(0)  # (1, H, W) -> (H, W)
+        
+        # 创建one-hot编码: (2, H, W)
+        mask_one_hot = torch.zeros(2, mask.shape[0], mask.shape[1], dtype=torch.float32)
+        mask_one_hot[0, :, :] = (mask == 0).float()  # 通道0: 无效区域 (0值)
+        mask_one_hot[1, :, :] = (mask == 1).float()  # 通道1: 有效区域 (1值)
+        
+        # 验证：确保每个像素只有一个通道为1
+        assert torch.allclose(mask_one_hot.sum(dim=0), torch.ones_like(mask, dtype=torch.float32)), \
+            "每个像素必须有且仅有一个通道为1"
+        
+        # 现在mask形状为: (2, H, W)
+        # DataLoader batch后会变为: (B, 2, H, W)
+        
+        return data, mask_one_hot
 
-        return data, mask
     def _augment(self, data, mask):
         if torch.rand(1) > 0.5:
             data = torch.flip(data, dims=[-1])
@@ -183,51 +192,38 @@ class SEN12Dataset(Dataset):
 # ==================== 使用示例 ====================
 from torch.utils.data import DataLoader
 
-
 def main():
-    # 创建数据集
     train_dataset = SEN12Dataset(
         txt_path='train.txt',
         data_dir='./data',
-        json_path='norm.json',  # 直接使用你的JSON文件
+        json_path='norm.json',
         augment=True
     )
 
-    val_dataset = SEN12Dataset(
-        txt_path='train.txt',
-        data_dir='./data',
-        json_path='norm.json',
-        augment=False
-    )
-
-    # DataLoader
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
 
-    # 测试
     print("=" * 50)
     print("训练集测试:")
     for data, mask in train_loader:
-        print(f'Data: {data.shape}') 
-        print(f'Mask: {mask.shape}')
+        print(f'Data: {data.shape}')  # torch.Size([4, C, H, W])
+        print(f'Mask: {mask.shape}')  # torch.Size([4, 2, H, W])
         print(f'Data范围: {data.min():.2f} - {data.max():.2f}')
-        print(f'Mask唯一值: {torch.unique(mask)}')
-        break
-
-    print("\n" + "=" * 50)
-    print("验证集测试:")
-    for data, mask in val_loader:
-        print(f'Data: {data.shape}')
-        print(f'Mask: {mask.shape}')
-        print(f'Data范围: {data.min():.2f} - {data.max():.2f}')
+        print(f'Mask形状: {mask.shape}')
+        print(f'Mask通道0 (无效区域) 值: {torch.unique(mask[:, 0, :, :])}')  # 应该是0和1
+        print(f'Mask通道1 (有效区域) 值: {torch.unique(mask[:, 1, :, :])}')  # 应该是0和1
+        print(f'每个像素的和: {mask.sum(dim=1).min():.0f} - {mask.sum(dim=1).max():.0f}')  # 应该都是1
+        
+        # 检查一个batch中的第一个样本
+        sample_mask = mask[0]  # (2, H, W)
+        print(f"\n第一个样本mask通道0的统计:")
+        print(f"  无效像素数量: {(sample_mask[0] == 1).sum().item()}")
+        print(f"  有效像素数量: {(sample_mask[1] == 1).sum().item()}")
+        print(f"  总像素数: {sample_mask[0].numel()}")
         break
 
     print("\n数据集信息:")
     print(f"训练集样本数: {len(train_dataset)}")
-    print(f"验证集样本数: {len(val_dataset)}")
     print(f"总波段数: {len(train_dataset.all_bands)}")
-    print(f"波段列表: {train_dataset.all_bands}")
-
 
 if __name__ == "__main__":
     main()

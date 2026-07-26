@@ -927,7 +927,7 @@ class CMNextSeg(nn.Module):
 if __name__ == '__main__':
     img_size = 128
     drop_path_rate = 0.1
-    model = CMNextSeg(num_classes=1, img_size=img_size, drop_path_rate=drop_path_rate)
+    model = CMNextSeg(num_classes=2, img_size=img_size, drop_path_rate=drop_path_rate)
     x = torch.randn(1, 3, 15, img_size, img_size)   # (B, T, 15, H, W)
     with torch.no_grad():
         y = model(x)

@@ -6,24 +6,23 @@ def compute_metrics(output, target):
     计算二分类分割指标（micro-average over all pixels）。
 
     Args:
-        output: torch.Tensor, shape (b, 1, h, w), 模型输出的 logits
-        target: torch.Tensor, shape (b, 1, h, w), 0/1 标签
+        output: torch.Tensor, shape (B, 2, H, W), 模型输出的 logits（双通道 softmax）
+        target: torch.Tensor, shape (B, 2, H, W), one-hot 标签
 
     Returns:
         dict: { 'iou': float, 'f1': float, 'precision': float, 'recall': float }
     """
-    # sigmoid > 0.5 得到二值预测
-    pred = (torch.sigmoid(output) > 0.5).long()
-    target = target.long()
+    # softmax argmax 得到类别预测
+    pred = torch.argmax(output, dim=1)       # (B, H, W)
+    target = target.argmax(dim=1).long()     # (B, 2, H, W) one-hot → (B, H, W) class indices
 
     # 展平为 1D
-    pred = pred.view(-1)
-    target = target.view(-1)
+    pred = pred.reshape(-1)
+    target = target.reshape(-1)
 
     tp = (pred * target).sum().float()
     fp = (pred * (1 - target)).sum().float()
     fn = ((1 - pred) * target).sum().float()
-    tn = ((1 - pred) * (1 - target)).sum().float()
 
     eps = 1e-7
 

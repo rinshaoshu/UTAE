@@ -58,15 +58,15 @@ class UNet3D(nn.Module):
     Output: [B, num_classes, H, W] tensor
 
     Example:
-        >>> model = UNet3D(
+        model = UNet3D(
         ...     in_channels=10,
         ...     num_classes=1,
         ...     img_res=128,
         ...     dropout=0.0
         ... )
-        >>> x = torch.randn(2, 15, 10, 128, 128)  # [B, T, C, H, W]
-        >>> output = model(x)
-        >>> print(output.shape)
+        x = torch.randn(2, 15, 10, 128, 128)  # [B, T, C, H, W]
+         output = model(x)
+         print(output.shape)
         torch.Size([2, 1, 128, 128])
     """
     def __init__(self, in_channels, num_classes, img_res=128, dropout=0.0):

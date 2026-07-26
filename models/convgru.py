@@ -242,7 +242,7 @@ if __name__ == "__main__":
     input_tensor = torch.randn(bs, t, c, h, w)
 
     model = ConvGRU_Seg(
-        num_classes=1,
+        num_classes=2,
         img_res=h,
         in_channels=c,
         kernel_size=(3, 3),

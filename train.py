@@ -9,7 +9,7 @@ from models.swinutae import SwinUNetHeadWithTemporal
 from models.CMXSegTemporal import CMXSeg
 from models.CMNextSegTemporal import CMNextSeg
 
-from utils.loss import get_seg_loss
+from utils.loss import CE_Dice
 from utils.metrics import compute_metrics
 from utils.logger import CSVLogger
 
@@ -41,6 +41,10 @@ class SegmentationTrainer:
 
     负责训练/验证循环、loss 计算（通过 criterion）、
     指标记录（通过 CSVLogger）、模型保存。
+
+    支持 DS 融合模型（forward 需要 train=True/False 参数）:
+        设置 is_fusion=True 时，训练自动传 train=True，验证自动传 train=False，
+        验证 loss 用 CE_Dice 计算 fused 输出。
     """
 
     def __init__(
@@ -58,7 +62,8 @@ class SegmentationTrainer:
             gradient_clip=1.0,
             print_interval=10,
             save_interval=10,
-            pretrained_path=None,  # 新增参数
+            pretrained_path=None,
+            is_fusion=False,
     ):
         self.model = model
         self.train_loader = train_loader
@@ -72,6 +77,7 @@ class SegmentationTrainer:
         self.print_interval = print_interval
         self.save_interval = save_interval
         self.pretrained_path = pretrained_path
+        self.is_fusion = is_fusion
 
         os.makedirs(save_dir, exist_ok=True)
         self.save_dir = save_dir
@@ -128,7 +134,10 @@ class SegmentationTrainer:
             mask = mask.to(self.device)
 
             self.optimizer.zero_grad()
-            output = self.model(data)
+            if self.is_fusion:
+                output = self.model(data, train=True)
+            else:
+                output = self.model(data)
             loss = self.criterion(output, mask)
             loss.backward()
 
@@ -151,6 +160,9 @@ class SegmentationTrainer:
         total_loss = 0.0
         total_batches = len(self.val_loader)
 
+        # 融合模型验证时只用 CE_Dice 算 fused 输出的 loss
+        val_loss_fn = CE_Dice() if self.is_fusion else self.criterion
+
         all_outputs = []
         all_masks = []
 
@@ -158,8 +170,11 @@ class SegmentationTrainer:
             data = data.to(self.device)
             mask = mask.to(self.device)
 
-            output = self.model(data)
-            loss = self.criterion(output, mask)
+            if self.is_fusion:
+                output = self.model(data, train=False)
+            else:
+                output = self.model(data)
+            loss = val_loss_fn(output, mask)
             total_loss += loss.item()
 
             all_outputs.append(output.cpu())
@@ -228,7 +243,7 @@ def main():
     )
 
     # 模型
-    model = CMNextSeg(num_classes=1, img_size=128, drop_path_rate=0.1)
+    model = CMNextSeg(num_classes=2, img_size=128, drop_path_rate=0.1)
 
     # 优化器 & 调度器
     optimizer = torch.optim.AdamW(
@@ -245,7 +260,7 @@ def main():
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        criterion=get_seg_loss,
+        criterion=CE_Dice(),
         optimizer=optimizer,
         scheduler=scheduler,
         epochs=EPOCHS,

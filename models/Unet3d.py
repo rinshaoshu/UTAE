@@ -159,7 +159,7 @@ if __name__ == "__main__":
     # 创建模型
     model = UNet3D(
         in_channels=c,
-        num_classes=1,
+        num_classes=2,
         img_res=h,
         dropout=0.0
     )
