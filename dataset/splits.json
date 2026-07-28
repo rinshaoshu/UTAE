@@ -1,0 +1,20 @@
+{
+  "input_dir": "../data",
+  "output_dir": "split",
+  "clip_data": true,
+  "filter_criteria": {
+    "satellites": ["s2","asc", "dsc"],
+    "annotated_only": true,
+    "non_annotated_only": false,
+    "min_annotated_pixel": 50,
+    "include_patterns": [],
+    "exclude_patterns": [],
+    "min_confidence": null,
+    "max_confidence": null
+  },
+  "n_workers": 40,
+  "test_size": 0.2,
+  "val_size": 0.2,
+  "seed": 42,
+  "export_geodataframe": true
+}

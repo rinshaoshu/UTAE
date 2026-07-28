@@ -1,5 +1,6 @@
 """
 test0001.py — 所有模型各跑 3 个 training batch，验证 forward/loss/backward 全流程
+使用真实数据集
 """
 import os
 import sys
@@ -12,12 +13,12 @@ from utils.loss import CE_Dice, DSTLoss
 # ===================== 配置 =====================
 BATCH_SIZE = 4
 NUM_BATCHES = 3
-IMG_SIZE = 128
+IMG_SIZE = 256
 TRAIN_TXT = 'train.txt'
 DATA_DIR = './data'
 JSON_PATH = 'norm.json'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-# =================================================
+# ================================================
 
 
 def env_check():
@@ -36,27 +37,17 @@ def env_check():
     print(f"  工作目录:   {os.getcwd()}")
 
     # 关键数据文件
-    files = [
-        TRAIN_TXT, JSON_PATH,
-        os.path.join(DATA_DIR, 'data'),
-    ]
+    files = [TRAIN_TXT, JSON_PATH, os.path.join(DATA_DIR, 'data')]
     for f in files:
         ok = "✓" if os.path.exists(f) else "✗"
         print(f"  {ok} {f}")
 
     # 模型文件存在性
     model_files = [
-        'models/utae.py',
-        'models/swinutae.py',
-        'models/convgru.py',
-        'models/Unet3d.py',
-        'models/CMXSegTemporal.py',
-        'models/CMNextSegTemporal.py',
-        'models/ESASegTemporal.py',
-        'models/DSTUtea.py',
-        'dataset.py',
-        'utils/loss.py',
-        'utils/metrics.py',
+        'models/utae.py', 'models/swinutae.py', 'models/convgru.py',
+        'models/Unet3d.py', 'models/CMXSegTemporal.py',
+        'models/CMNextSegTemporal.py', 'models/ESASegTemporal.py',
+        'models/DSTUtea.py', 'dataset.py', 'utils/loss.py', 'utils/metrics.py',
     ]
     for f in model_files:
         ok = "✓" if os.path.exists(f) else "✗"
@@ -66,7 +57,7 @@ def env_check():
 
 
 def build_model(name):
-    """复用 check.py 的模型构建逻辑。"""
+    """根据名称创建模型实例。"""
     if name == 'UTAE':
         from models.utae import UTAE
         return UTAE(in_channels=15, num_classes=2)
@@ -133,8 +124,9 @@ def train_3batches(name, model, loader_iter):
         optimizer.step()
 
         batch_losses.append(loss.item())
+        out_shape = tuple(output[0].shape if is_fusion else output.shape)
         print(f"    Batch {i+1}/{NUM_BATCHES}: loss={loss.item():.4f}, "
-              f"in={tuple(data.shape)}, out={tuple(output[0].shape if is_fusion else output.shape)}")
+              f"in={tuple(data.shape)}, out={out_shape}")
 
     return batch_losses
 
@@ -144,15 +136,16 @@ def main():
     print(f"设备: {DEVICE}")
     print(f"每个模型跑 {NUM_BATCHES} 个 training batch, batch_size={BATCH_SIZE}\n")
 
-    # ---------- DataLoader ----------
+    # ---------- 加载数据集 ----------
     dataset = SEN12Dataset(
-        txt_path=TRAIN_TXT, data_dir=DATA_DIR,
-        json_path=JSON_PATH, augment=True,
+        txt_path=TRAIN_TXT,
+        data_dir=DATA_DIR,
+        json_path=JSON_PATH,
+        augment=False,
     )
-    loader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0,
-    )
-    loader_iter = iter(loader)
+    # 取前 BATCH_SIZE 个样本组成固定子集
+    subset = Subset(dataset, range(BATCH_SIZE))
+    loader = DataLoader(subset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     # ---------- 模型列表 ----------
     model_names = [
@@ -169,7 +162,8 @@ def main():
             param_count = sum(p.numel() for p in model.parameters())
             print(f"  参数量: {param_count:,}")
 
-            losses = train_3batches(name, model, loader_iter)
+            # 每个模型重新创建 loader 的迭代器，避免状态残留
+            losses = train_3batches(name, model, iter(loader))
 
             avg_loss = sum(losses) / len(losses)
             print(f"  ✓ 通过  平均 loss: {avg_loss:.4f}")

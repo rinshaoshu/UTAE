@@ -38,3 +38,18 @@ print(f"总行数: {total}")
 print(f"目标比例: {ratio1:.0%} : {ratio2:.0%} : {ratio3:.0%}")
 print(f"实际分组: {len(group1)} : {len(group2)} : {len(group3)}")
 print(f"实际比例: {len(group1)/total:.1%} : {len(group2)/total:.1%} : {len(group3)/total:.1%}")
+"""
+chimanimani_: 1126
+china_: 117
+hiroshima_: 864
+hokkaido_: 290
+indonesia_: 571
+italy_: 5278
+itogon_: 217
+kyrgyzstan: 1802
+lanaodelnorte_: 63
+nepal_: 14
+newzealand_: 1145
+usa_alaska_: 141
+usa_puertorico_: 91
+"""

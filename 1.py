@@ -1,4 +1,1 @@
-import xarray as xr
-
-ds = xr.open_dataset('data/asc/chimanimani_63.nc')
-print(ds)
+# Clip data: s2 [0-10000], s1 [-50,10], dem [0-8800]

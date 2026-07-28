@@ -8,6 +8,7 @@ from models.utae import UTAE
 from models.swinutae import SwinUNetHeadWithTemporal
 from models.CMXSegTemporal import CMXSeg
 from models.CMNextSegTemporal import CMNextSeg
+from models.DSTUtea import nnFormerDSTemporalFusion
 
 from utils.loss import CE_Dice
 from utils.metrics import compute_metrics
@@ -243,7 +244,7 @@ def main():
     )
 
     # 模型
-    model = CMNextSeg(num_classes=2, img_size=128, drop_path_rate=0.1)
+    model = nnFormerDSTemporalFusion()
 
     # 优化器 & 调度器
     optimizer = torch.optim.AdamW(

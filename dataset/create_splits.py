@@ -1,0 +1,957 @@
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from argparse import ArgumentParser
+
+import numpy as np
+import pandas as pd
+import torch
+import xarray as xr
+from joblib import Parallel, delayed
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+import geopandas as gpd
+from shapely.geometry import Point
+
+
+
+class NetCDFDataset(Dataset):
+    """Dataset for reading and stacking variables from NetCDF files."""
+
+    def __init__(self, files, exclude_vars=("MASK", "SCL", "spatial_ref"), clip_data=True):
+        self.files = files
+        self.exclude_vars = exclude_vars
+        self.clip_ranges = {'s1': (-50, 10), 's2': (0, 10000), 'dem': (0, 8800)}
+        self.clip_data = clip_data
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        with xr.open_dataset(self.files[idx]) as ds:
+            # Determine satellite type from filename
+            filename = self.files[idx].name.lower()
+            if "s1asc" in filename or "s1dsc" in filename:
+                sat_type = 's1'
+            elif "s2" in filename:
+                sat_type = 's2'
+            else:
+                sat_type = None
+
+            # Stack data with per-band clipping
+            data_arrays = []
+            for var in ds.data_vars:
+                if var not in self.exclude_vars:
+                    data = ds[var].values
+
+                    # Apply clipping if enabled
+                    if self.clip_data:
+                        var_lower = var.lower()
+                        if 'dem' in var_lower:
+                            clip_min, clip_max = self.clip_ranges['dem']
+                            data = np.clip(data, clip_min, clip_max)
+                        elif sat_type in self.clip_ranges:
+                            clip_min, clip_max = self.clip_ranges[sat_type]
+                            data = np.clip(data, clip_min, clip_max)
+
+                    data_arrays.append(data)
+
+        return np.stack(data_arrays, axis=0)
+
+
+def collate_fn(batch):
+    """Collate function for DataLoader."""
+    return torch.concat([torch.Tensor(b) for b in batch], dim=0)
+
+
+def compute_mean_std(files, n_workers=4, clip_data=True):
+    """Compute per-band mean and std for NetCDF files."""
+    if not files:
+        return torch.zeros(0), torch.zeros(0)
+
+    dataset = NetCDFDataset(files, clip_data=clip_data)
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=n_workers, drop_last=False, shuffle=False,
+                            collate_fn=collate_fn)
+
+    n_bands = dataset[0].shape[0]
+    sum_data = torch.zeros([n_bands], dtype=torch.float64)
+    count_data = torch.zeros([n_bands], dtype=torch.float64)
+
+    for sample in tqdm(dataloader, desc="Computing mean"):
+        sample = sample.reshape(n_bands, -1).double()
+        sum_data += torch.nansum(sample, dim=-1)
+        count_data += torch.sum(~sample.isnan(), dim=-1).double()
+
+    mean = sum_data / count_data
+    sum_sq = torch.zeros([n_bands], dtype=torch.float64)
+
+    for sample in tqdm(dataloader, desc="Computing variance"):
+        sample = sample.reshape(n_bands, -1).double()
+        sum_sq += torch.nansum((sample - mean.unsqueeze(-1)) ** 2, dim=-1)
+
+    std = torch.sqrt(sum_sq / count_data)
+    return mean, std
+
+
+@dataclass
+class FilterCriteria:
+    """Filtering criteria for the split pipeline (replaces Hydra config)."""
+    satellites: list = field(default_factory=lambda: ["asc", "dsc", "s2"])
+    annotated_only: bool = False
+    non_annotated_only: bool = False
+    min_annotated_pixel: int = 0
+    include_patterns: list = field(default_factory=list)
+    exclude_patterns: list = field(default_factory=list)
+    min_confidence: float = None
+    max_confidence: float = None
+
+
+def check_file_metadata(file_path, criteria):
+    """Check if file meets filtering criteria."""
+    filename = file_path.name.lower()
+    file_path_str = str(file_path).lower()
+
+    # ====== 1. 检查排除模式 ======
+    if any(p.lower() in filename for p in criteria.exclude_patterns):
+        return False, None
+
+    # ====== 2. 检查包含模式 ======
+    if criteria.include_patterns and not any(p.lower() in filename for p in criteria.include_patterns):
+        return False, None
+
+    # ====== 3. 识别卫星类型 ======
+    sat_type = None
+
+    # 检查路径中的文件夹名
+    if "asc" in file_path_str:
+        sat_type = "asc"
+    elif "dsc" in file_path_str:
+        sat_type = "dsc"
+    elif "s2" in file_path_str:
+        sat_type = "s2"
+    else:
+        # 如果路径中也没有，尝试从文件名识别
+        if "asc" in filename:
+            sat_type = "asc"
+        elif "dsc" in filename:
+            sat_type = "dsc"
+        elif "s2" in filename:
+            sat_type = "s2"
+        else:
+            return False, None
+
+    # ====== 4. 检查卫星类型是否在允许列表中 ======
+    if sat_type not in criteria.satellites:
+        return False, None
+
+    # ====== 5. 打开并检查nc文件 ======
+    try:
+        with xr.open_dataset(file_path) as ds:
+            metadata = {"satellite_type": sat_type}
+
+            # ====== 6. 检查annotated属性 ======
+            is_annotated = ds.attrs.get("annotated")
+            metadata["annotated"] = is_annotated
+
+            # ====== 7. 标注状态过滤 ======
+            if criteria.annotated_only and is_annotated != "True":
+                return False, metadata
+
+            if criteria.non_annotated_only and is_annotated == "True":
+                return False, metadata
+
+            # ====== 8. 置信度过滤 ======
+            if is_annotated == "True":
+                conf_str = ds.attrs.get("date_confidence", "")
+                if conf_str:
+                    conf_vals = [float(c) for c in conf_str.split(",") if c]
+                    confidence = np.mean(conf_vals) if conf_vals else 0.0
+                else:
+                    confidence = 0.0
+            else:
+                confidence = 1.0
+
+            metadata["confidence"] = confidence
+
+            if criteria.min_confidence and confidence < criteria.min_confidence:
+                return False, metadata
+
+            if criteria.max_confidence and confidence > criteria.max_confidence:
+                return False, metadata
+
+            # ====== 9. 标注像素数量过滤 ======
+            if criteria.min_annotated_pixel is not None:
+                if "MASK" in ds.data_vars:
+                    mask = ds["MASK"].values
+                    if mask.ndim == 3:
+                        mask = mask[0]
+                    pixel_count = int(np.sum(mask == 1))
+                    metadata["annotated_pixel_count"] = pixel_count
+
+                    if pixel_count < criteria.min_annotated_pixel:
+                        return False, metadata
+                else:
+                    if criteria.min_annotated_pixel > 0:
+                        return False, metadata
+
+            # ====== 所有检查通过 ======
+            return True, metadata
+
+    except Exception as e:
+        logging.warning(f"Error reading {file_path}: {e}")
+        return False, None
+
+
+def filter_files(files, criteria, n_workers=4):
+    """Filter files based on criteria."""
+    results = Parallel(n_jobs=n_workers)(
+        delayed(check_file_metadata)(f, criteria)
+        for f in tqdm(files, desc="Filtering files")
+    )
+
+    filtered = [f for f, (ok, _) in zip(files, results) if ok]
+
+    if criteria.min_annotated_pixel:
+        logging.info(f"Applied min_annotated_pixel filter: {criteria.min_annotated_pixel}")
+
+    return filtered
+
+def extract_inventory(file_path):
+    """Extract inventory name from file path or metadata."""
+    try:
+        with xr.open_dataset(file_path) as ds:
+            for attr in ['inventory', 'region', 'location']:
+                if attr in ds.attrs:
+                    return str(ds.attrs[attr]).lower()
+    except:
+        pass
+
+    # Parse from filename
+    filename = re.sub(r"_(asc|dsc|s2)$", "", file_path.stem.lower())
+    parts = filename.split('_')
+    return parts[0] if parts else 'unknown'
+
+
+def process_patch_ratio(patch_file):
+    """Extract patch metadata including ratio, inventory, pixels, and coordinates."""
+    with xr.open_dataset(patch_file) as ds:
+        mask = ds["MASK"].isel(time=0).values
+        foreground = np.sum(mask == 1)
+        ratio = foreground / mask.size if mask.size > 0 else 0
+
+        # Extract coordinates
+        if 'center_lon' in ds.attrs and 'center_lat' in ds.attrs:
+            lon, lat = float(ds.attrs['center_lon']), float(ds.attrs['center_lat'])
+            crs = ds.attrs.get('crs', 'EPSG:4326')
+        elif 'x' in ds.coords and 'y' in ds.coords:
+            lon, lat = float(ds.x.values.mean()), float(ds.y.values.mean())
+            crs = ds.spatial_ref.attrs.get('crs_wkt', 'EPSG:4326') if 'spatial_ref' in ds.variables else 'EPSG:4326'
+        elif 'lon' in ds.coords and 'lat' in ds.coords:
+            lon, lat = float(ds.lon.values.mean()), float(ds.lat.values.mean())
+            crs = 'EPSG:4326'
+        else:
+            lon, lat, crs = 0.0, 0.0, 'EPSG:4326'
+
+    return {
+        "file": patch_file,
+        "pixel_ratio": ratio,
+        "inventory": extract_inventory(patch_file),
+        "annotated_pixels": int(foreground),
+        "lon": lon,
+        "lat": lat,
+        "crs": crs
+    }
+
+
+def compute_coverage_classes(files, n_workers=1):
+    """Compute coverage classes and extract metadata."""
+    if not files:
+        return np.array([]), np.array([]), np.array([]), {}
+
+    patch_data = Parallel(n_jobs=n_workers)(
+        delayed(process_patch_ratio)(f) for f in tqdm(files, desc="Computing coverage")
+    )
+
+    ratios = [p["pixel_ratio"] for p in patch_data]
+    inventories = [p["inventory"] for p in patch_data]
+
+    # Build metadata dict
+    metadata_dict = {}
+    for p in patch_data:
+        patch_id = file_key(p["file"])
+        metadata_dict[patch_id] = {
+            'inventory': p['inventory'],
+            'annotated_pixels': p['annotated_pixels'],
+            'lon': p['lon'],
+            'lat': p['lat'],
+            'crs': p['crs']
+        }
+
+    # Compute coverage classes
+    if ratios:
+        p25, p75 = np.percentile(ratios, [25, 75])
+        classes = [0 if r <= p25 else 1 if r <= p75 else 2 for r in ratios]
+    else:
+        classes = []
+
+    return (np.array([p["file"] for p in patch_data]),
+            np.array(classes),
+            np.array(inventories),
+            metadata_dict)
+
+
+def stratified_split_with_inventory(patches, coverage, inventory, test_size=0.2, val_size=0.2, seed=42):
+    """Split patches with inventory and coverage stratification."""
+    if len(patches) == 0:
+        return [], [], []
+
+    # Log inventory distribution
+    unique_inv, counts = np.unique(inventory, return_counts=True)
+    logging.info("=" * 60)
+    logging.info("INVENTORY DISTRIBUTION")
+    for inv, count in zip(unique_inv, counts):
+        logging.info(f"  {inv}: {count} ({count / len(inventory) * 100:.1f}%)")
+    logging.info("=" * 60)
+
+    # Create combined strata
+    combined = np.array([f"{c}_{i}" for c, i in zip(coverage, inventory)])
+    unique_strata, strata_counts = np.unique(combined, return_counts=True)
+
+    # Handle singletons
+    rare_mask = np.isin(combined, unique_strata[strata_counts == 1])
+    train_forced = np.where(rare_mask)[0]
+    idx_split = np.where(~rare_mask)[0]
+    stratify = combined[~rare_mask] if len(idx_split) > 0 else None
+
+    if len(train_forced) > 0:
+        logging.info(f"Forcing {len(train_forced)} singleton patches to train")
+
+    # Split
+    if len(idx_split) > 0:
+        train_val_idx, test_idx = train_test_split(
+            idx_split, test_size=test_size, stratify=stratify, random_state=seed
+        )
+
+        if len(train_val_idx) > 1:
+            stratify_tv = np.array([f"{coverage[i]}_{inventory[i]}" for i in train_val_idx])
+            train_idx, val_idx = train_test_split(
+                train_val_idx, test_size=val_size, stratify=stratify_tv, random_state=seed
+            )
+        else:
+            train_idx, val_idx = train_val_idx, np.array([], dtype=int)
+    else:
+        train_idx, val_idx, test_idx = np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=int)
+
+    train_idx = np.concatenate([train_idx, train_forced]) if len(train_forced) > 0 else train_idx
+
+    # Log split distribution
+    logging.info("SPLIT DISTRIBUTION BY INVENTORY")
+    for inv in unique_inv:
+        train_c = np.sum(inventory[train_idx] == inv)
+        val_c = np.sum(inventory[val_idx] == inv)
+        test_c = np.sum(inventory[test_idx] == inv)
+        total = train_c + val_c + test_c
+        logging.info(f"{inv}: Train={train_c}/{total} ({train_c / total * 100:.1f}%), "
+                     f"Val={val_c}/{total} ({val_c / total * 100:.1f}%), "
+                     f"Test={test_c}/{total} ({test_c / total * 100:.1f}%)")
+    logging.info("=" * 60)
+
+    return patches[train_idx], patches[val_idx], patches[test_idx]
+
+
+def file_key(file_path):
+    """Extract patch key by removing satellite identifier."""
+    return re.sub(r"_(asc|dsc|s2)", "", file_path.stem)
+
+
+def to_rel(base_dir, paths):
+    """Convert absolute paths to relative paths."""
+    return [str(p.relative_to(base_dir)) for p in paths]
+
+
+def align_files_strict(satellite_files):
+    """Keep only locations present in ALL satellites (strict alignment)."""
+    logging.info("=" * 60)
+    logging.info("ALIGNING FILES: STRICT (ALL SATELLITES REQUIRED)")
+    logging.info("=" * 60)
+
+    # Get keys for each satellite
+    sat_keys = {sat: {file_key(f) for f in files} for sat, files in satellite_files.items()}
+
+    for sat, keys in sat_keys.items():
+        logging.info(f"{sat.upper()}: {len(keys)} unique locations")
+
+    # Intersection of all satellites
+    common = set.intersection(*sat_keys.values())
+    logging.info(f"Common locations: {len(common)}")
+
+    # Filter files
+    aligned = {}
+    for sat, files in satellite_files.items():
+        aligned[sat] = sorted([f for f in files if file_key(f) in common])
+        removed = len(files) - len(aligned[sat])
+        if removed > 0:
+            logging.info(f"{sat.upper()}: Removed {removed} ({removed / len(files) * 100:.1f}%)")
+
+    logging.info("=" * 60)
+    return aligned
+
+
+def split_and_extract_metadata(files, test_size, val_size, seed, n_workers, force_reference='s2', strict=False):
+    """Split files and extract metadata in one go.
+
+    Args:
+        files: Dict of satellite files
+        test_size: Test split size
+        val_size: Validation split size
+        seed: Random seed
+        n_workers: Number of workers
+        force_reference: Force specific satellite as reference (default: 's2')
+        strict: If True, raise error if forced reference is not available
+    """
+    # Determine reference satellite
+    if force_reference and force_reference in files:
+        ref_sat = force_reference
+        logging.info(f"Using forced reference satellite: {ref_sat.upper()}")
+    else:
+        # Handle case where forced reference is not available
+        if force_reference and force_reference not in files:
+            if strict:
+                raise ValueError(
+                    f"Forced reference satellite '{force_reference}' not found in available satellites: {list(files.keys())}")
+            else:
+                # Fallback to satellite with most files
+                ref_sat = max(files.keys(), key=lambda k: len(files[k]))
+                logging.warning(f"Forced reference '{force_reference}' not found, using {ref_sat.upper()} instead")
+        else:
+            # No force_reference specified, use satellite with most files
+            ref_sat = max(files.keys(), key=lambda k: len(files[k]))
+
+    ref_files = files[ref_sat]
+    logging.info(f"Using {ref_sat.upper()} as reference: {len(ref_files)} files")
+
+    # Compute coverage and metadata
+    patches, coverage, inventory, metadata = compute_coverage_classes(ref_files, n_workers)
+
+    # Split
+    train, val, test = stratified_split_with_inventory(
+        patches, coverage, inventory, test_size, val_size, seed
+    )
+
+    # Extract patch IDs
+    return {
+        'train': {file_key(f) for f in train},
+        'val': {file_key(f) for f in val},
+        'test': {file_key(f) for f in test}
+    }, metadata
+
+
+def map_splits_to_files(files, patch_splits):
+    """Map patch ID splits to actual file paths for each satellite."""
+    splits = {}
+
+    for sat, file_list in files.items():
+        sat_splits = {'train': [], 'val': [], 'test': []}
+
+        for f in file_list:
+            pid = file_key(f)
+            for split_name in ['train', 'val', 'test']:
+                if pid in patch_splits[split_name]:
+                    sat_splits[split_name].append(f)
+                    break
+
+        # Sort for consistency
+        splits[sat] = {k: sorted(v) for k, v in sat_splits.items()}
+
+        logging.info(f"{sat.upper()}: Train={len(sat_splits['train'])}, "
+                     f"Val={len(sat_splits['val'])}, Test={len(sat_splits['test'])}")
+
+    return splits
+
+
+def create_splits_geodataframe(splits, files, metadata):
+    """Create GeoDataFrame from cached metadata."""
+    ref_sat = list(splits.keys())[0]
+
+    # Map patch_id to split
+    patch_to_split = {}
+    for split_name, file_list in splits[ref_sat].items():
+        for f in file_list:
+            patch_to_split[file_key(f)] = split_name
+
+    # Build records
+    records = []
+    for f in files[ref_sat]:
+        pid = file_key(f)
+        meta = metadata.get(pid, {})
+        records.append({
+            'patch_id': pid,
+            'split': patch_to_split.get(pid, 'unknown'),
+            'inventory': meta.get('inventory', 'unknown'),
+            'annotated_pixels': meta.get('annotated_pixels', 0),
+            'lon': meta.get('lon', 0.0),
+            'lat': meta.get('lat', 0.0),
+            'crs_original': meta.get('crs', 'EPSG:4326')
+        })
+
+    df = pd.DataFrame(records)
+
+    # Create geometries by CRS
+    gdfs = []
+    for crs, group in df.groupby('crs_original'):
+        geometry = [Point(r['lon'], r['lat']) for _, r in group.iterrows()]
+        gdf = gpd.GeoDataFrame(group, geometry=geometry, crs=crs)
+        try:
+            gdf = gdf.to_crs('EPSG:4326')
+        except Exception as e:
+            logging.warning(f"CRS transform failed for {crs}: {e}")
+        gdfs.append(gdf)
+
+    gdf = pd.concat(gdfs, ignore_index=True)
+    gdf['lon'] = gdf.geometry.x
+    gdf['lat'] = gdf.geometry.y
+
+    logging.info(f"GeoDataFrame: {len(gdf)} patches")
+    return gdf
+
+
+def save_geodataframe(gdf, output_dir, base_name='patch_locations'):
+    """Save GeoDataFrame as GeoJSON."""
+    if gdf is None or len(gdf) == 0:
+        return
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    file = output_dir / f"{base_name}.geojson"
+    gdf.to_file(file, driver='GeoJSON')
+    logging.info(f"Saved: {file}")
+
+
+def create_splits_json(splits, all_files, metadata, input_dir, output_dir, filename="splits.json"):
+    """
+    Create a splits.json file with detailed patch info.
+    This function is general and works for single or multiple satellites.
+
+    Args:
+        splits (dict): Dict mapping satellite to its data splits {'satellite': {'train': [...], 'val': [...], 'test': [...]}}.
+        all_files (dict): Dict mapping satellite to its list of all files {'satellite': [file1, file2, ...]}.
+        metadata (dict): Dict with metadata for each patch_id.
+        input_dir (Path): Base directory of input files for making paths relative.
+        output_dir (Path): Directory to save the output JSON file.
+        filename (str): Name of the output file.
+    """
+    # Build patch_id -> files mapping from the 'all_files' dictionary
+    all_patches = {}
+    for sat, file_list in all_files.items():
+        for file_path in file_list:
+            patch_id = file_key(file_path)
+            if patch_id not in all_patches:
+                all_patches[patch_id] = {}
+            all_patches[patch_id][sat] = file_path
+
+    # Build patch_id -> split mapping from the 'splits' dictionary
+    # We use the first satellite in the splits as the reference for split assignment
+    ref_sat = list(splits.keys())[0]
+    patch_to_split = {}
+    for split_name, file_list in splits[ref_sat].items():
+        for f in file_list:
+            patch_to_split[file_key(f)] = split_name
+
+    # Build the final dictionary entries
+    result = {'train': [], 'val': [], 'test': []}
+    for pid in sorted(patch_to_split.keys()):
+        split_name = patch_to_split[pid]
+
+        entry = {'id': pid}
+
+        # Add all satellite files for this patch
+        for sat in sorted(all_files.keys()):
+            if pid in all_patches and sat in all_patches[pid]:
+                entry[sat] = str(all_patches[pid][sat].relative_to(input_dir))
+
+        # Add metadata if available
+        if pid in metadata:
+            entry['pixel_annotated'] = metadata[pid].get('annotated_pixels', 0)
+            entry['inventory'] = metadata[pid].get('inventory', 'unknown')
+
+        result[split_name].append(entry)
+
+    # Save the JSON file
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / filename
+    with open(output_file, 'w') as f:
+        json.dump(result, f, indent=2)
+
+    logging.info(f"Saved: {output_file}")
+
+
+def write_split_txts(splits, input_dir, output_dir):
+    """Write train.txt / val.txt / test.txt, one relative .nc path per line.
+
+    Args:
+        splits (dict): {satellite: {'train': [abs paths], 'val': [...], 'test': [...]}}.
+        input_dir (Path): base dir used to make paths relative.
+        output_dir (Path): directory where the .txt files are written.
+    """
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for split in ["train", "val", "test"]:
+        lines = []
+        for sat in sorted(splits.keys()):
+            for f in sorted(splits[sat][split]):
+                try:
+                    rel = Path(f).relative_to(input_dir)
+                except ValueError:
+                    rel = Path(f)
+                lines.append(str(rel))
+        (output_dir / f"{split}.txt").write_text("\n".join(lines) + "\n")
+        logging.info(f"Saved: {output_dir / f'{split}.txt'} ({len(lines)} lines)")
+
+
+def create_norm_json(splits, input_dir, output_dir, n_workers, clip_data=True, filename="norm.json"):
+    """
+    Create a norm.json file with normalization stats for the training set.
+    This function is general and works for single or multiple satellites.
+
+    Args:
+        splits (dict): Dict with splits for each satellite {'satellite': {'train': [abs_paths], 'val': [...], 'test': [...]}}.
+                      Files can be either absolute Path objects or relative string paths.
+        input_dir (Path): Base directory to resolve relative paths if needed.
+        output_dir (Path): Directory to save the output JSON file.
+        n_workers (int): Number of workers for mean/std computation.
+        filename (str): Name of the output file.
+    """
+    norm_data = {}
+
+    for sat, split_dict in sorted(splits.items()):
+        # Get training files
+        train_files = split_dict.get('train', [])
+        if not train_files:
+            logging.warning(f"No training files for {sat.upper()}, skipping normalization.")
+            continue
+
+        # Convert to absolute paths if they're relative strings
+        abs_train_files = []
+        for f in train_files:
+            if isinstance(f, str):
+                abs_train_files.append(input_dir / Path(f))
+            elif isinstance(f, Path):
+                if f.is_absolute():
+                    abs_train_files.append(f)
+                else:
+                    abs_train_files.append(input_dir / f)
+            else:
+                abs_train_files.append(Path(f))
+
+        # Get band names from the first file
+        try:
+            with xr.open_dataset(abs_train_files[0]) as ds:
+                bands = [v for v in ds.data_vars if v not in ("MASK", "SCL", "spatial_ref")]
+        except Exception as e:
+            logging.error(f"Could not read bands from {abs_train_files[0]}: {e}")
+            continue
+
+        logging.info(f"Computing normalization for {sat.upper()} using {len(abs_train_files)} training files...")
+        mean_t, std_t = compute_mean_std(abs_train_files, n_workers, clip_data=clip_data)
+
+        # 修改：保存为列表格式
+        norm_data[sat] = {
+            'mean': [float(mean_t[i]) for i, _ in enumerate(bands)],
+            'std': [float(std_t[i]) for i, _ in enumerate(bands)]
+        }
+        logging.info(f"{sat.upper()}: Computed stats for {len(bands)} bands")
+
+    # Save the JSON file
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / filename
+    with open(output_file, 'w') as f:
+        json.dump(norm_data, f, indent=2)
+
+    logging.info(f"Saved: {output_file}")
+
+def run_pipeline(
+        input_dir,
+        output_dir,
+        criteria: FilterCriteria,
+        test_size=0.2,
+        val_size=0.2,
+        seed=42,
+        n_workers=4,
+        clip_data=True,
+        export_geodataframe=True,
+):
+    """Run the full split-creation pipeline (config-free, callable directly).
+
+    Args:
+        input_dir: Root directory containing per-satellite subfolders (s2/, s1asc/, s1dsc/).
+        output_dir: Where to write splits.json / norm.json / geojson outputs.
+        criteria: FilterCriteria instance describing filtering rules.
+        test_size / val_size / seed / n_workers: split + parallel settings.
+        clip_data: whether to clip values before computing normalization stats.
+        export_geodataframe: whether to export patch_locations.geojson.
+    """
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    logging.info("=" * 80)
+    logging.info("DATA SPLITTING PIPELINE")
+    logging.info("=" * 80)
+
+    # STEP 1: Filter files
+    logging.info("[STEP 1] Filtering files...")
+    satellite_files = {}
+
+    # 打印配置信息
+    logging.info(f"配置的卫星: {criteria.satellites}")
+    logging.info(f"annotated_only: {criteria.annotated_only}")
+    logging.info(f"non_annotated_only: {criteria.non_annotated_only}")
+    logging.info(f"min_annotated_pixel: {criteria.min_annotated_pixel}")
+    logging.info(f"include_patterns: {criteria.include_patterns}")
+    logging.info(f"exclude_patterns: {criteria.exclude_patterns}")
+    logging.info(f"min_confidence: {criteria.min_confidence}")
+    logging.info(f"max_confidence: {criteria.max_confidence}")
+
+    for sat in criteria.satellites:
+        # 尝试多种可能的文件夹名
+        possible_dirs = [sat, sat.upper(), sat.lower()]
+        found_dir = None
+
+        for dir_name in possible_dirs:
+            test_dir = input_dir / dir_name
+            if test_dir.exists() and test_dir.is_dir():
+                found_dir = test_dir
+                break
+
+        if found_dir is None:
+            logging.warning(f"⚠️ 未找到 {sat.upper()} 目录 (尝试: {possible_dirs})")
+            satellite_files[sat] = []
+            continue
+
+        files = sorted(found_dir.glob("*.nc"))
+        logging.info(f"{sat.upper()}: {len(files)} files found in {found_dir}")
+        satellite_files[sat] = filter_files(files, criteria, n_workers)
+        logging.info(f"{sat.upper()}: {len(satellite_files[sat])} after filtering")
+
+    # STEP 2: Unaligned splits (per-satellite)
+    logging.info("\n[STEP 2] Creating UNALIGNED splits...")
+    unaligned_splits = {}
+    metadata_dicts = {}
+
+    for sat, files in satellite_files.items():
+        # Dictionaries for the current satellite
+        sat_files_dict = {sat: files}
+
+        patch_splits, metadata = split_and_extract_metadata(
+            sat_files_dict, test_size, val_size, seed, n_workers, force_reference=None
+        )
+        splits = map_splits_to_files(sat_files_dict, patch_splits)
+        unaligned_splits[sat] = splits[sat]
+        metadata_dicts[sat] = metadata
+
+        # Save per-satellite outputs
+        sat_dir = output_dir / sat
+        create_splits_json(splits=splits, all_files=sat_files_dict, metadata=metadata, input_dir=input_dir,
+                           output_dir=sat_dir, filename="splits.json")
+        # Create norm json with absolute paths in splits
+        create_norm_json(splits, input_dir, sat_dir, n_workers, clip_data=clip_data, filename="norm.json")
+        write_split_txts(splits, input_dir, sat_dir)
+
+        # GeoDataFrame
+        if export_geodataframe:
+            try:
+                gdf = create_splits_geodataframe(splits, {sat: files}, metadata)
+                save_geodataframe(gdf, sat_dir)
+            except Exception as e:
+                logging.error(f"GeoDataFrame error: {e}")
+
+    # STEP 3: Aligned splits (strict)
+    if len(satellite_files) > 1:
+        logging.info("\n[STEP 3] Creating ALIGNED splits (strict)...")
+
+        aligned_files = align_files_strict(satellite_files)
+        patch_splits, metadata = split_and_extract_metadata(
+            aligned_files, test_size, val_size, seed, n_workers, force_reference='s2'
+        )
+        aligned_splits = map_splits_to_files(aligned_files, patch_splits)
+
+        # Create global files
+        create_splits_json(aligned_splits, aligned_files, metadata, input_dir, output_dir,
+                           filename="splits_aligned.json")
+
+        # Create norm json with absolute paths in splits
+        create_norm_json(aligned_splits, input_dir, output_dir, n_workers, clip_data=clip_data,
+                         filename="norm_aligned.json")
+        write_split_txts(aligned_splits, input_dir, output_dir)
+
+        # GeoDataFrame
+        if export_geodataframe:
+            try:
+                gdf = create_splits_geodataframe(aligned_splits, aligned_files, metadata)
+                save_geodataframe(gdf, output_dir, "patch_locations_aligned")
+            except Exception as e:
+                logging.error(f"GeoDataFrame error: {e}")
+
+    # Save config (plain dict, no Hydra)
+    with open(output_dir / "config.json", 'w') as f:
+        json.dump({
+            "input_dir": str(input_dir),
+            "output_dir": str(output_dir),
+            "clip_data": clip_data,
+            "filter_criteria": criteria.__dict__,
+            "n_workers": n_workers,
+            "test_size": test_size,
+            "val_size": val_size,
+            "seed": seed,
+            "export_geodataframe": export_geodataframe,
+        }, f, indent=2)
+
+    # Summary
+    logging.info("\n" + "=" * 80)
+    logging.info("✓ COMPLETE")
+    logging.info("=" * 80)
+    logging.info("\nUNALIGNED (per-satellite):")
+    for sat, splits in unaligned_splits.items():
+        total = sum(len(splits[k]) for k in ['train', 'val', 'test'])
+        logging.info(f"  {sat.upper()}: {total} patches")
+
+    if len(satellite_files) > 1:
+        logging.info("\nALIGNED (strict):")
+        first = list(aligned_splits.keys())[0]
+        total = sum(len(aligned_splits[first][k]) for k in ['train', 'val', 'test'])
+        logging.info(f"  Total: {total} patches across {len(aligned_splits)} satellites")
+
+    logging.info("=" * 80)
+
+
+def _str2bool(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).lower() in ("yes", "true", "t", "1")
+
+
+def build_argparser():
+    parser = ArgumentParser(
+        description="Create train/val/test splits + normalization stats for Sen12Landslides (.nc data)."
+    )
+    parser.add_argument("--input_dir", type=str, required=False,
+                        help="Root dir with per-satellite subfolders (s2/, asc/, dsc/).")
+    parser.add_argument("--output_dir", type=str, required=False,
+                        help="Where to write splits.json / norm.json / geojson.")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to a JSON config file (e.g. config/splits.json). "
+                             "Keys override argparse defaults; CLI flags still win.")
+    parser.add_argument("--satellites", nargs="+", default=["asc", "dsc", "s2"],
+                        help="Satellites to process, e.g. --satellites s2 asc dsc")
+    parser.add_argument("--annotated_only", action="store_true", help="Keep only annotated samples.")
+    parser.add_argument("--non_annotated_only", action="store_true", help="Keep only non-annotated samples.")
+    parser.add_argument("--min_annotated_pixel", type=int, default=0, help="Min annotated pixels per patch.")
+    parser.add_argument("--include_patterns", nargs="+", default=[], help="Only keep filenames containing these.")
+    parser.add_argument("--exclude_patterns", nargs="+", default=[], help="Drop filenames containing these.")
+    parser.add_argument("--min_confidence", type=float, default=None, help="Minimum date-confidence threshold.")
+    parser.add_argument("--max_confidence", type=float, default=None, help="Maximum date-confidence threshold.")
+    parser.add_argument("--n_workers", type=int, default=4, help="Parallel workers.")
+    parser.add_argument("--test_size", type=float, default=0.2, help="Test split fraction.")
+    parser.add_argument("--val_size", type=float, default=0.2, help="Val split fraction (of remainder).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--clip_data", type=_str2bool, default=True, help="Clip data before stats (true/false).")
+    parser.add_argument("--export_geodataframe", type=_str2bool, default=True,
+                        help="Export patch_locations.geojson (true/false).")
+    return parser
+
+
+def _load_config_defaults(config_path):
+    """Build an argparse defaults dict from a JSON config file."""
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    fc = cfg.get("filter_criteria", {})
+    defaults = {
+        "input_dir": cfg.get("input_dir"),
+        "output_dir": cfg.get("output_dir"),
+        "satellites": fc.get("satellites", ["asc", "dsc", "s2"]),
+        "annotated_only": fc.get("annotated_only", False),
+        "non_annotated_only": fc.get("non_annotated_only", False),
+        "min_annotated_pixel": fc.get("min_annotated_pixel", 0),
+        "include_patterns": fc.get("include_patterns", []),
+        "exclude_patterns": fc.get("exclude_patterns", []),
+        "min_confidence": fc.get("min_confidence", None),
+        "max_confidence": fc.get("max_confidence", None),
+        "n_workers": cfg.get("n_workers", 4),
+        "test_size": cfg.get("test_size", 0.2),
+        "val_size": cfg.get("val_size", 0.2),
+        "seed": cfg.get("seed", 42),
+        "clip_data": cfg.get("clip_data", True),
+        "export_geodataframe": cfg.get("export_geodataframe", True),
+    }
+    # Drop None values so they don't override argparse's own defaults
+    return {k: v for k, v in defaults.items() if v is not None}
+
+
+def main():
+    # ========== 直接配置部分 ==========
+    # 在这里配置你的配置文件路径
+    CONFIG_FILE = "splits.json"  # <--- 修改这个路径为你实际的配置文件
+
+    # 如果配置文件存在，直接使用；否则提示错误
+    config_path = Path(CONFIG_FILE)
+    if not config_path.exists():
+        print(f"错误: 配置文件 '{CONFIG_FILE}' 不存在!")
+        print("请创建配置文件或修改 CONFIG_FILE 变量指向正确的路径")
+        return
+
+    # 加载配置
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    # 从配置文件读取参数
+    fc = cfg.get("filter_criteria", {})
+
+    input_dir = cfg.get("input_dir")
+    output_dir = cfg.get("output_dir")
+
+    if not input_dir or not output_dir:
+        print("错误: 配置文件中必须包含 'input_dir' 和 'output_dir'")
+        return
+
+    # 创建过滤条件
+    criteria = FilterCriteria(
+        satellites=fc.get("satellites", ["asc", "dsc", "s2"]),
+        annotated_only=fc.get("annotated_only", False),
+        non_annotated_only=fc.get("non_annotated_only", False),
+        min_annotated_pixel=fc.get("min_annotated_pixel", 0),
+        include_patterns=fc.get("include_patterns", []),
+        exclude_patterns=fc.get("exclude_patterns", []),
+        min_confidence=fc.get("min_confidence", None),
+        max_confidence=fc.get("max_confidence", None),
+    )
+
+    # 运行管道
+    run_pipeline(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        criteria=criteria,
+        test_size=cfg.get("test_size", 0.2),
+        val_size=cfg.get("val_size", 0.2),
+        seed=cfg.get("seed", 42),
+        n_workers=cfg.get("n_workers", 4),
+        clip_data=cfg.get("clip_data", True),
+        export_geodataframe=cfg.get("export_geodataframe", True),
+    )
+
+
+if __name__ == "__main__":
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    main()

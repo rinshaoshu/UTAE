@@ -7,6 +7,9 @@ Reference: Huang et al., "Deep evidential fusion with uncertainty quantification
 and reliability learning for multimodal medical image segmentation", Information Fusion, 2025.
 """
 
+
+
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -36,6 +39,8 @@ class ContiguousGrad(torch.autograd.Function):
 # =============================================================================
 # Section 2: Dempster-Shafer Evidence Mapping Module (Ds1)
 # =============================================================================
+
+# 在 DsFunction1 类中，修改 backward 方法
 
 class DsFunction1(torch.autograd.Function):
     """
@@ -168,6 +173,11 @@ class DsFunction1(torch.autograd.Function):
                 temp2[k] = -prototype_dim * test9 * test7
                 Dinput[n, :] = temp2.mean(0)
 
+        # ============================================================
+        # 修复：必须返回6个梯度，对应forward的6个参数
+        # forward: (input, W, BETA, alpha, gamma, class_dim)
+        # 其中 class_dim 不需要梯度
+        # ============================================================
         if ctx.needs_input_grad[0]:
             grad_input = Dinput
         if ctx.needs_input_grad[1]:
@@ -178,8 +188,10 @@ class DsFunction1(torch.autograd.Function):
             grad_alpha = Dalpha
         if ctx.needs_input_grad[4]:
             grad_gamma = Dgamma
+        # class_dim 不需要梯度
+        grad_class_dim = None
 
-        return grad_input, grad_W, grad_BETA, grad_alpha, grad_gamma
+        return grad_input, grad_W, grad_BETA, grad_alpha, grad_gamma, grad_class_dim
 
 
 class Ds1(nn.Module):
@@ -1501,3 +1513,222 @@ class nnFormerDSTemporalFusion(nn.Module):
         else:
             nc = self.num_classes
             return fused, m1[:, :nc], m2[:, :nc], m3[:, :nc]
+
+
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def dice_loss(output, target_onehot, smooth=1.0):
+    """
+    计算多类别 Dice 损失（softmax 输出）。
+
+    Args:
+        output: torch.Tensor, shape (B, C, H, W), 模型输出的 logits (C >= 2)
+        target_onehot: torch.Tensor, shape (B, C, H, W), one-hot 标签
+        smooth: float, 平滑系数，防止分母为0
+
+    Returns:
+        loss: torch.Tensor, 标量
+    """
+    prob = F.softmax(output, dim=1)                                  # (B, C, H, W)
+    target = target_onehot.float()                                   # (B, C, H, W)
+
+    intersection = (prob * target).sum(dim=(0, 2, 3))                # (C,)
+    union = prob.sum(dim=(0, 2, 3)) + target.sum(dim=(0, 2, 3))    # (C,)
+
+    dice_per_class = (2. * intersection + smooth) / (union + smooth)
+    return 1 - dice_per_class.mean()
+
+
+class CE_Dice(nn.Module):
+    """加权 CrossEntropy + Dice 混合损失（二分类）。
+
+    Loss = 0.5 × CrossEntropy(class_weight=[1,5]) + 0.5 × Dice(smooth=1)
+
+    Input:  output [B, 2, H, W] logits
+            target [B, 2, H, W] one-hot
+    Output: scalar loss
+    """
+    def __init__(self):
+        super(CE_Dice, self).__init__()
+        self.ce_weight = torch.tensor([1.0, 5.0])
+
+    def forward(self, output, target):
+        device = output.device
+        self.ce_weight = self.ce_weight.to(device)
+
+        ce_loss = F.cross_entropy(
+            output, target.argmax(dim=1), weight=self.ce_weight,
+        )
+        dice = dice_loss(output, target, smooth=1.0)
+        return 0.5 * ce_loss + 0.5 * dice
+
+
+class DSTLoss(nn.Module):
+    """Deep Evidential Temporal Fusion 损失。
+
+    Loss = CE_Dice(fused) + CE_Dice(m1) + CE_Dice(m2) + CE_Dice(m3)
+
+    Input:  outputs = (fused, m1, m2, m3)，各 [B, C, H, W] class masses
+            target  [B, C, H, W] one-hot
+    Output: scalar loss
+    """
+    def __init__(self):
+        super(DSTLoss, self).__init__()
+        self.ce_dice = CE_Dice()
+
+    def forward(self, outputs, target):
+        fused, m1, m2, m3 = outputs
+        return (self.ce_dice(fused, target) +
+                self.ce_dice(m1, target) +
+                self.ce_dice(m2, target) +
+                self.ce_dice(m3, target))
+
+
+import torch
+import torch.nn.functional as F
+
+# ============================================================================
+# 1. 创建模型和数据
+# ============================================================================
+
+# 创建模型
+model = nnFormerDSTemporalFusion(
+    num_classes=2,  # 二分类
+    crop_size=[128, 128]  # 输入图像尺寸
+)
+
+# 创建输入数据
+B, T, C, H, W = 2, 15, 15, 128, 128
+x = torch.randn(B, T, C, H, W)  # [Batch, Time, Channels, Height, Width]
+
+# 创建标签 (随机生成)
+target_indices = torch.randint(0, 2, (B, H, W))  # [B, H, W]
+target_onehot = F.one_hot(target_indices, num_classes=2).permute(0, 3, 1, 2).float()  # [B, C, H, W]
+
+print("=" * 60)
+print("数据形状检查:")
+print(f"输入 x: {x.shape}")  # [2, 15, 15, 128, 128]
+print(f"标签 one-hot: {target_onehot.shape}")  # [2, 2, 128, 128]
+print("=" * 60)
+
+# ============================================================================
+# 2. 模型前向传播 (训练模式)
+# ============================================================================
+
+print("\n>>> 模型前向传播 (train=True)")
+model.train()
+outputs = model(x, train=True)
+
+# outputs 是一个元组: (fused, m1, m2, m3)
+fused, m1, m2, m3 = outputs
+
+print(f"fused (融合输出): {fused.shape}")  # [2, 2, 128, 128]
+print(f"m1 (模态1输出):   {m1.shape}")  # [2, 2, 128, 128]
+print(f"m2 (模态2输出):   {m2.shape}")  # [2, 2, 128, 128]
+print(f"m3 (模态3输出):   {m3.shape}")  # [2, 2, 128, 128]
+
+# ============================================================================
+# 3. 计算损失
+# ============================================================================
+
+print("\n>>> 计算损失")
+criterion = DSTLoss()
+loss = criterion(outputs, target_onehot)
+
+print(f"总损失: {loss.item():.4f}")
+
+# ============================================================================
+# 4. 分解查看损失各分量
+# ============================================================================
+
+print("\n>>> 分解损失分量")
+ce_dice = CE_Dice()
+
+# 分别计算各模态的损失
+loss_fused = ce_dice(fused, target_onehot)
+loss_m1 = ce_dice(m1, target_onehot)
+loss_m2 = ce_dice(m2, target_onehot)
+loss_m3 = ce_dice(m3, target_onehot)
+
+print(f"Loss fused: {loss_fused.item():.6f}")
+print(f"Loss m1:    {loss_m1.item():.6f}")
+print(f"Loss m2:    {loss_m2.item():.6f}")
+print(f"Loss m3:    {loss_m3.item():.6f}")
+print(f"总和:       {(loss_fused + loss_m1 + loss_m2 + loss_m3).item():.6f}")
+print(f"DSTLoss:    {loss.item():.6f}")
+
+# ============================================================================
+# 5. 进一步分解 CE_Dice 损失
+# ============================================================================
+
+print("\n>>> 分解 CE_Dice 损失 (以 fused 为例)")
+ce_weight = torch.tensor([1.0, 5.0])
+
+# CrossEntropy 部分
+ce_loss = F.cross_entropy(fused, target_onehot.argmax(dim=1), weight=ce_weight)
+
+
+# Dice 部分
+def dice_loss(output, target_onehot, smooth=1.0):
+    prob = F.softmax(output, dim=1)
+    target = target_onehot.float()
+    intersection = (prob * target).sum(dim=(0, 2, 3))
+    union = prob.sum(dim=(0, 2, 3)) + target.sum(dim=(0, 2, 3))
+    dice_per_class = (2. * intersection + smooth) / (union + smooth)
+    return 1 - dice_per_class.mean()
+
+
+dice = dice_loss(fused, target_onehot, smooth=1.0)
+
+print(f"CE 部分:  {ce_loss.item():.6f}")
+print(f"Dice 部分: {dice.item():.6f}")
+print(f"CE_Dice:   {0.5 * ce_loss.item() + 0.5 * dice.item():.6f}")
+print(f"CE_Dice (直接计算): {loss_fused.item():.6f}")
+
+# ============================================================================
+# 6. 完整的训练步
+# ============================================================================
+
+print("\n>>> 完整训练步")
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+for epoch in range(3):
+    optimizer.zero_grad()
+
+    # 前向传播
+    outputs = model(x, train=True)
+
+    # 计算损失
+    loss = criterion(outputs, target_onehot)
+
+    # 反向传播
+    loss.backward()
+    optimizer.step()
+
+    print(f"Epoch {epoch + 1}: Loss = {loss.item():.6f}")
+
+# ============================================================================
+# 7. 推理模式 (只输出融合结果)
+# ============================================================================
+
+print("\n>>> 推理模式 (train=False)")
+model.eval()
+with torch.no_grad():
+    fused_only = model(x, train=False)
+    print(f"推理输出 (仅融合): {fused_only.shape}")  # [2, 2, 128, 128]
+
+# ============================================================================
+# 8. 可视化输出 (可选)
+# ============================================================================
+
+print("\n>>> 输出统计")
+print(f"fused: min={fused.min().item():.4f}, max={fused.max().item():.4f}, mean={fused.mean().item():.4f}")
+print(f"m1:    min={m1.min().item():.4f}, max={m1.max().item():.4f}, mean={m1.mean().item():.4f}")
+print(f"m2:    min={m2.min().item():.4f}, max={m2.max().item():.4f}, mean={m2.mean().item():.4f}")
+print(f"m3:    min={m3.min().item():.4f}, max={m3.max().item():.4f}, mean={m3.mean().item():.4f}")
+
+print("\n" + "=" * 60)
+print("完成!")
