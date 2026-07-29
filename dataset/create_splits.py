@@ -590,14 +590,13 @@ def create_splits_json(splits, all_files, metadata, input_dir, output_dir, filen
 
 
 def write_split_txts(splits, input_dir, output_dir):
-    """Write train.txt / val.txt / test.txt, one relative .nc path per line.
+    """Write train.txt / val.txt / test.txt, one filename per line (no path).
 
     Args:
         splits (dict): {satellite: {'train': [abs paths], 'val': [...], 'test': [...]}}.
-        input_dir (Path): base dir used to make paths relative.
+        input_dir (Path): base dir (unused, kept for compatibility).
         output_dir (Path): directory where the .txt files are written.
     """
-    input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -605,18 +604,14 @@ def write_split_txts(splits, input_dir, output_dir):
         lines = []
         for sat in sorted(splits.keys()):
             for f in sorted(splits[sat][split]):
-                try:
-                    rel = Path(f).relative_to(input_dir)
-                except ValueError:
-                    rel = Path(f)
-                lines.append(str(rel))
+                lines.append(Path(f).name)
         (output_dir / f"{split}.txt").write_text("\n".join(lines) + "\n")
         logging.info(f"Saved: {output_dir / f'{split}.txt'} ({len(lines)} lines)")
 
 
-def create_norm_json(splits, input_dir, output_dir, n_workers, clip_data=True, filename="norm.json"):
+def create_norm_json(splits, input_dir, output_dir, n_workers, clip_data=True, filename="s2_norm.json"):
     """
-    Create a norm.json file with normalization stats for the training set.
+    Create a s2_norm.json file with normalization stats for the training set.
     This function is general and works for single or multiple satellites.
 
     Args:
@@ -690,7 +685,7 @@ def run_pipeline(
 
     Args:
         input_dir: Root directory containing per-satellite subfolders (s2/, s1asc/, s1dsc/).
-        output_dir: Where to write splits.json / norm.json / geojson outputs.
+        output_dir: Where to write splits.json / s2_norm.json / geojson outputs.
         criteria: FilterCriteria instance describing filtering rules.
         test_size / val_size / seed / n_workers: split + parallel settings.
         clip_data: whether to clip values before computing normalization stats.
@@ -762,7 +757,7 @@ def run_pipeline(
         create_splits_json(splits=splits, all_files=sat_files_dict, metadata=metadata, input_dir=input_dir,
                            output_dir=sat_dir, filename="splits.json")
         # Create norm json with absolute paths in splits
-        create_norm_json(splits, input_dir, sat_dir, n_workers, clip_data=clip_data, filename="norm.json")
+        create_norm_json(splits, input_dir, sat_dir, n_workers, clip_data=clip_data, filename="s2_norm.json")
         write_split_txts(splits, input_dir, sat_dir)
 
         # GeoDataFrame
@@ -773,30 +768,34 @@ def run_pipeline(
             except Exception as e:
                 logging.error(f"GeoDataFrame error: {e}")
 
-    # STEP 3: Aligned splits (strict)
+    # STEP 3: Union splits (s2 reference, all satellites, tolerate missing)
     if len(satellite_files) > 1:
-        logging.info("\n[STEP 3] Creating ALIGNED splits (strict)...")
+        logging.info("\n[STEP 3] Creating UNION splits (s2 reference, keep all satellites)...")
 
-        aligned_files = align_files_strict(satellite_files)
         patch_splits, metadata = split_and_extract_metadata(
-            aligned_files, test_size, val_size, seed, n_workers, force_reference='s2'
+            satellite_files, test_size, val_size, seed, n_workers, force_reference='s2'
         )
-        aligned_splits = map_splits_to_files(aligned_files, patch_splits)
+        union_splits = map_splits_to_files(satellite_files, patch_splits)
 
-        # Create global files
-        create_splits_json(aligned_splits, aligned_files, metadata, input_dir, output_dir,
-                           filename="splits_aligned.json")
+        # Log missing counts per satellite vs s2
+        s2_keys = {file_key(f) for f in satellite_files.get('s2', [])}
+        for sat in sorted(satellite_files.keys()):
+            if sat == 's2':
+                continue
+            sat_keys = {file_key(f) for f in satellite_files[sat]}
+            missing = len(s2_keys - sat_keys)
+            if missing > 0:
+                logging.info(f"  {sat.upper()}: {missing} patches missing vs s2")
 
-        # Create norm json with absolute paths in splits
-        create_norm_json(aligned_splits, input_dir, output_dir, n_workers, clip_data=clip_data,
-                         filename="norm_aligned.json")
-        write_split_txts(aligned_splits, input_dir, output_dir)
+        create_splits_json(union_splits, satellite_files, metadata, input_dir, output_dir,
+                           filename="splits_union.json")
+        create_norm_json(union_splits, input_dir, output_dir, n_workers, clip_data=clip_data,
+                         filename="s2_norm.json")
 
-        # GeoDataFrame
         if export_geodataframe:
             try:
-                gdf = create_splits_geodataframe(aligned_splits, aligned_files, metadata)
-                save_geodataframe(gdf, output_dir, "patch_locations_aligned")
+                gdf = create_splits_geodataframe(union_splits, satellite_files, metadata)
+                save_geodataframe(gdf, output_dir, "patch_locations")
             except Exception as e:
                 logging.error(f"GeoDataFrame error: {e}")
 
@@ -824,10 +823,10 @@ def run_pipeline(
         logging.info(f"  {sat.upper()}: {total} patches")
 
     if len(satellite_files) > 1:
-        logging.info("\nALIGNED (strict):")
-        first = list(aligned_splits.keys())[0]
-        total = sum(len(aligned_splits[first][k]) for k in ['train', 'val', 'test'])
-        logging.info(f"  Total: {total} patches across {len(aligned_splits)} satellites")
+        logging.info("\nUNION (s2 reference):")
+        first = list(union_splits.keys())[0]
+        total = sum(len(union_splits[first][k]) for k in ['train', 'val', 'test'])
+        logging.info(f"  Total: {total} patches across {len(union_splits)} satellites")
 
     logging.info("=" * 80)
 
@@ -845,7 +844,7 @@ def build_argparser():
     parser.add_argument("--input_dir", type=str, required=False,
                         help="Root dir with per-satellite subfolders (s2/, asc/, dsc/).")
     parser.add_argument("--output_dir", type=str, required=False,
-                        help="Where to write splits.json / norm.json / geojson.")
+                        help="Where to write splits.json / s2_norm.json / geojson.")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to a JSON config file (e.g. config/splits.json). "
                              "Keys override argparse defaults; CLI flags still win.")

@@ -1,9 +1,13 @@
 {
-  "input_dir": "../data",
+  "input_dir": "..\\data",
   "output_dir": "split",
   "clip_data": true,
   "filter_criteria": {
-    "satellites": ["s2","asc", "dsc"],
+    "satellites": [
+      "s2",
+      "asc",
+      "dsc"
+    ],
     "annotated_only": true,
     "non_annotated_only": false,
     "min_annotated_pixel": 30,

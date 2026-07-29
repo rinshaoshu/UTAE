@@ -3,12 +3,8 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import SEN12Dataset
-from models.utae import UTAE
-from models.swinutae import SwinUNetHeadWithTemporal
-from models.CMXSegTemporal import CMXSeg
-from models.CMNextSegTemporal import CMNextSeg
-from models.DSTUtea import nnFormerDSTemporalFusion
+from dataset.dataset import SEN12Dataset
+from models.Unet3d import UNet3D
 
 from utils.loss import CE_Dice
 from utils.metrics import compute_metrics
@@ -22,15 +18,16 @@ EPOCHS = 50
 TRAIN_TXT = 'train.txt'
 VAL_TXT = 'val.txt'
 DATA_DIR = './data'
-JSON_PATH = 'norm.json'
+JSON_PATH = 'dataset/s2_norm.json'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-SAVE_DIR = './checkpoints/CMNextSeg'
-LOG_DIR = './logs/CMNextSeg'
+SAVE_DIR = './checkpoints]'
+LOG_DIR = './logs'
 GRADIENT_CLIP = 1.0
 PRINT_INTERVAL = 10
 SAVE_INTERVAL = 10
 NUM_WORKERS = 4
-PRETRAINED_PATH = 'checkpoints/best_model.pth'  # 预训练权重路径，None表示不加载
+PRETRAINED_PATH = None  # 预训练权重路径，None表示不加载
+IN_CHANNELS =11
 
 
 
@@ -224,16 +221,18 @@ class SegmentationTrainer:
 def main():
     # DataLoader
     train_dataset = SEN12Dataset(
-        txt_path=TRAIN_TXT,
-        data_dir=DATA_DIR,
-        json_path=JSON_PATH,
-        augment=True,
+        txt_path=TRAIN_TXT,  # 包含文件名的txt
+        data_dir=DATA_DIR,  # 数据目录
+        norm_dir=JSON_PATH,
+        band= ['s2'],
+        augment=True  # 是否启用数据增强
     )
     val_dataset = SEN12Dataset(
-        txt_path=VAL_TXT,
-        data_dir=DATA_DIR,
-        json_path=JSON_PATH,
-        augment=False,
+        txt_path=VAL_TXT,  # 包含文件名的txt
+        data_dir=DATA_DIR,  # 数据目录
+        norm_dir=JSON_PATH,
+        band=['s2'],
+        augment=False  # 是否启用数据增强
     )
 
     train_loader = DataLoader(
@@ -244,7 +243,13 @@ def main():
     )
 
     # 模型
-    model = nnFormerDSTemporalFusion()
+    model = UNet3D(
+        in_channels=11,
+            num_classes=2,
+            img_res=128,
+            dropout=0.0
+        )
+
 
     # 优化器 & 调度器
     optimizer = torch.optim.AdamW(

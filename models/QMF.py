@@ -1,5 +1,5 @@
 """
-Modified version: Accepts tensor input only, outputs [B, C, H, W]
+Taken from https://github.com/roserustowicz/crop-type-mapping/
 """
 
 import torch
@@ -54,19 +54,19 @@ def up_conv_block(in_dim, out_dim):
 class UNet3D(nn.Module):
     """3D UNet for semantic segmentation of image time series.
 
-    Input: [B, T, C, H, W] tensor
-    Output: [B, num_classes, H, W] tensor
+    Input: [B, T, C, H, W]
+    Output: [B, num_classes, H, W]
 
     Example:
-        model = UNet3D(
+        >>> model = UNet3D(
         ...     in_channels=10,
         ...     num_classes=1,
         ...     img_res=128,
         ...     dropout=0.0
         ... )
-        x = torch.randn(2, 15, 10, 128, 128)  # [B, T, C, H, W]
-         output = model(x)
-         print(output.shape)
+        >>> x = torch.randn(2, 15, 10, 128, 128)
+        >>> output = model(x)
+        >>> print(output.shape)
         torch.Size([2, 1, 128, 128])
     """
     def __init__(self, in_channels, num_classes, img_res=128, dropout=0.0):
@@ -103,7 +103,7 @@ class UNet3D(nn.Module):
             x: [B, T, C, H, W] input tensor
 
         Returns:
-            [B, num_classes, H, W] segmentation output
+            [B, num_classes, H, W] segmentation map
         """
         # Permute from [B, T, C, H, W] to [B, C, T, H, W]
         x = x.permute(0, 2, 1, 3, 4)
@@ -147,26 +147,62 @@ class UNet3D(nn.Module):
                 mode="bilinear", align_corners=True
             )
 
-        return out  # 直接返回张量 [B, num_classes, H, W]
+        return out
 
 
-if __name__ == "__main__":
-    bs, t, c, h, w = 4, 15, 10, 128, 128
 
-    # 创建模型
-    model = UNet3D(
-        in_channels=c,
-        num_classes=1,
-        img_res=h,
-        dropout=0.0
-    )
+class QMF(nn.Module):
+    def __init__(self, channel_splits=[11, 3, 3], dim=2):
+        """
+        Args:
+            channel_splits: 三个模型的输入通道数列表
+            dim: 通道维度索引 (如果是 BTCHW，dim=2；如果是 BCTHW，dim=1)
+        """
+        super(QMF, self).__init__()
+        self.dim = dim
+        self.channel_splits = channel_splits
 
-    # 输入张量 [B, T, C, H, W]
-    x = torch.randn(bs, t, c, h, w)
+        self.s2 = UNet3D(in_channels=channel_splits[0], num_classes=2, img_res=128, dropout=0.0)
+        self.asc = UNet3D(in_channels=channel_splits[1], num_classes=2, img_res=128, dropout=0.0)
+        self.dsc = UNet3D(in_channels=channel_splits[2], num_classes=2, img_res=128, dropout=0.0)
 
-    # 前向传播
-    output = model(x)
+    def QMFfuse(self, s2_logits, asc_logits, dsc_logits):
+        """
+        输入:
+            s2_logits: [B, C, H, W]  - 光谱模态logits
+            asc_logits: [B, C, H, W] - 角度模态logits
+            dsc_logits: [B, C, H, W] - 距离模态logits
+        输出:
+            fused_out: [B, C, H, W] - 融合后的输出
+            s2_out, asc_out, dsc_out: [B, C, H, W] - 各模态输出
+            s2_conf, asc_conf, dsc_conf: [B, 1, H, W] - 各模态置信度
+        """
+        # 1. 直接使用输入的logits
+        s2_out = s2_logits
+        asc_out = asc_logits
+        dsc_out = dsc_logits
 
-    print(f"✓ Test passed")
-    print(f"  Input:  {x.shape}")      # [4, 15, 10, 128, 128]
-    print(f"  Output: {output.shape}")  # [4, 1, 128, 128]
+        # 2. 计算各模态置信度（空间自适应）
+        s2_conf = -0.1 * torch.logsumexp(s2_out, dim=1, keepdim=True)
+        asc_conf = -0.1 * torch.logsumexp(asc_out, dim=1, keepdim=True)
+        dsc_conf = -0.1 * torch.logsumexp(dsc_out, dim=1, keepdim=True)
+
+        # 3. 动态融合（加权求和）
+        fused_out = s2_out * s2_conf + asc_out * asc_conf + dsc_out * dsc_conf
+        return {
+            's2': (s2_out, s2_conf),
+            'asc': (asc_out, asc_conf),
+            'dsc': (dsc_out, dsc_conf),
+            'fused': fused_out
+        }
+
+    def forward(self, x):
+        # 使用 split 自动拆分
+        splits = torch.split(x, self.channel_splits, dim=self.dim)
+
+        s2_out = self.s2(splits[0])
+        asc_out = self.asc(splits[1])
+        dsc_out = self.dsc(splits[2])
+
+        qmf = self.QMFfuse(s2_out, asc_out, dsc_out)
+        return qmf

@@ -150,22 +150,121 @@ class UNet3D(nn.Module):
         return out
 
 
-if __name__ == "__main__":
-    bs, t, c, h, w = 4, 15, 10, 128, 128
+s2 = UNet3D(
+    in_channels=11,
+    num_classes=2,
+    img_res=128,
+    dropout=0.0
+)
+asc = UNet3D(
+    in_channels=3,
+    num_classes=2,
+    img_res=128,
+    dropout=0.0
+)
+dsc = UNet3D(
+    in_channels=3,
+    num_classes=2,
+    img_res=128,
+    dropout=0.0
+)
+def tmc_core_multi(s2, asc, dsc, num_classes):
+    """
+    TMC核心函数 - 三模态版本
+    输入:
+        s, asc, dsc: [B, C, H, W]
+    输出:
+        每个模态的 prob [B, C, H, W], uncertainty [B, 1, H, W]
+        融合后的 prob [B, C, H, W], uncertainty [B, 1, H, W]
+    """
+    B, C, H, W = s2.shape
 
-    # Test with direct tensor
-    x = torch.randn(bs, t, c, h, w)
+    # ===== Step 1: 每个像素独立处理 =====
+    # [B, C, H, W] → [B*H*W, C]
+    s2_reshaped = s2.permute(0, 2, 3, 1).reshape(-1, C)
+    asc_reshaped = asc.permute(0, 2, 3, 1).reshape(-1, C)
+    dsc_reshaped = dsc.permute(0, 2, 3, 1).reshape(-1, C)
 
-    model = UNet3D(
-        in_channels=c,
-        num_classes=1,
-        img_res=h,
-        dropout=0.0
-    )
+    # ===== Step 2: logits → alpha (证据参数) =====
+    s2_alpha = F.softplus(s2_reshaped) + 1
+    asc_alpha = F.softplus(asc_reshaped) + 1
+    dsc_alpha = F.softplus(dsc_reshaped) + 1
 
-    out = model(x)
+    # ===== Step 3: DS融合 - 依次融合三个模态 =====
+    fused_alpha = s2_alpha  # 从S2开始
+    for alpha in [asc_alpha, dsc_alpha]:
+        S1 = fused_alpha.sum(dim=1, keepdim=True)
+        S2 = alpha.sum(dim=1, keepdim=True)
 
-    print(f"✓ Test passed")
-    print(f"  Input:  {x.shape}")
-    print(f"  Output: {out.shape}")
-    print(f"  Expected output shape: [batch_size, num_classes, H, W]")
+        # 计算每个模态的信念质量
+        b1 = (fused_alpha - 1) / S1
+        b2 = (alpha - 1) / S2
+
+        # 计算不确定性
+        u1 = C / S1
+        u2 = C / S2
+
+        # 计算冲突K
+        # b1.unsqueeze(2) @ b2.unsqueeze(1) 得到 [N, C, C]
+        K = ((b1.unsqueeze(2) @ b2.unsqueeze(1)).sum(dim=(1, 2), keepdim=True) -
+             (b1 * b2).sum(dim=1, keepdim=True))
+
+        # 融合信念质量
+        b_fused = (b1 * b2 + b1 * u2 + u1 * b2) / (1 - K + 1e-8)
+        u_fused = (u1 * u2) / (1 - K + 1e-8)
+
+        # 转回alpha
+        S_fused = C / u_fused
+        fused_alpha = b_fused * S_fused + 1
+
+    # ===== Step 4: 计算每个模态的输出 =====
+    def compute_output(alpha):
+        S = alpha.sum(dim=1, keepdim=True)  # [N, 1]
+        prob_flat = alpha / S  # [N, C]
+        uncertainty_flat = num_classes / S  # [N, 1]
+
+        # 恢复为 [B, C, H, W] 和 [B, 1, H, W]
+        prob = prob_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        uncertainty = uncertainty_flat.reshape(B, H, W, 1).permute(0, 3, 1, 2)
+        return prob, uncertainty
+
+    # ===== Step 5: 输出所有模态的结果 =====
+    s2_prob, s2_uncertainty = compute_output(s2_alpha)
+    asc_prob, asc_uncertainty = compute_output(asc_alpha)
+    dsc_prob, dsc_uncertainty = compute_output(dsc_alpha)
+    fused_prob, fused_uncertainty = compute_output(fused_alpha)
+
+    return {
+        's2': (s2_prob, s2_uncertainty),
+        'asc': (asc_prob, asc_uncertainty),
+        'dsc': (dsc_prob, dsc_uncertainty),
+        'fused': (fused_prob, fused_uncertainty)
+    }
+
+
+class TMC(nn.Module):
+    def __init__(self, channel_splits=[11, 3, 3], dim=2):
+        """
+        Args:
+            channel_splits: 三个模型的输入通道数列表
+            dim: 通道维度索引 (如果是 BTCHW，dim=2；如果是 BCTHW，dim=1)
+        """
+        super(TMC, self).__init__()
+        self.dim = dim
+        self.channel_splits = channel_splits
+
+        self.s2 = UNet3D(in_channels=channel_splits[0], num_classes=2, img_res=128, dropout=0.0)
+        self.asc = UNet3D(in_channels=channel_splits[1], num_classes=2, img_res=128, dropout=0.0)
+        self.dsc = UNet3D(in_channels=channel_splits[2], num_classes=2, img_res=128, dropout=0.0)
+
+    def forward(self, x):
+        # 使用 split 自动拆分
+        splits = torch.split(x, self.channel_splits, dim=self.dim)
+
+        s2_out = self.s2(splits[0])
+        asc_out = self.asc(splits[1])
+        dsc_out = self.dsc(splits[2])
+
+        tmc=tmc_core_multi(s2_out,asc_out,dsc_out,2)
+
+        return tmc
