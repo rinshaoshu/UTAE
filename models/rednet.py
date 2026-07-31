@@ -225,7 +225,7 @@ class RedNet(nn.Module):
 
 # ---------- 时序封装 ----------
 class TemporalRedNet(nn.Module):
-    def __init__(self, num_classes=37, in_channels_mod1=11, in_channels_mod2=6,
+    def __init__(self, num_classes=2, in_channels_mod1=11, in_channels_mod2=6,
                  temporal_agg='attn', pretrained=False):
         super(TemporalRedNet, self).__init__()
         self.num_classes = num_classes

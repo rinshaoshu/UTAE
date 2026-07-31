@@ -453,7 +453,7 @@ class MACANet3DWrapper(nn.Module):
     输入: [B, T, C, H, W] (C = modal1_channels + modal2_channels)
     输出: [B, num_classes, H, W]
     """
-    def __init__(self, modal1_channels=11, modal2_channels=6, num_classes=1,
+    def __init__(self, modal1_channels=11, modal2_channels=6, num_classes=2,
                  pretrained=False, backbone='ResNet101', att_type=None):
         super(MACANet3DWrapper, self).__init__()
         self.modal1_channels = modal1_channels
