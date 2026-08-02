@@ -1,2 +1,0 @@
-model_name,model_path,loss,f1,iou,precision,recall,timestamp
-checkpoint-epoch10,checkpoints/checkpoint-epoch10.pth,0.27591222524642944,0.7245652675628662,0.6286301612854004,0.675927996635437,0.8266589641571045,2026-07-30 13:30:53

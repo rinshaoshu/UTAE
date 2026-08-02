@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import geopandas as gpd
 from shapely.geometry import Point
-
+# Clip data: s2 [0-10000], s1 [-50,10], dem [0-8800]
 
 
 class NetCDFDataset(Dataset):
@@ -220,7 +220,7 @@ def filter_files(files, criteria, n_workers=4):
     return filtered
 
 def extract_inventory(file_path):
-    """Extract inventory name from file path or metadata."""
+    """Extract inventory name from file miss_path or metadata."""
     try:
         with xr.open_dataset(file_path) as ds:
             for attr in ['inventory', 'region', 'location']:
@@ -590,7 +590,7 @@ def create_splits_json(splits, all_files, metadata, input_dir, output_dir, filen
 
 
 def write_split_txts(splits, input_dir, output_dir):
-    """Write train.txt / val.txt / test.txt, one filename per line (no path).
+    """Write train.txt / val.txt / test.txt, one filename per line (no miss_path).
 
     Args:
         splits (dict): {satellite: {'train': [abs paths], 'val': [...], 'test': [...]}}.

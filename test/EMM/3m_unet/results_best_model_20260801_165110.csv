@@ -1,0 +1,2 @@
+model_name,model_path,loss,f1,iou,precision,recall,timestamp
+best_model,checkpoints/Unet_3m/best_model.pth,1.2828731536865234,0.4906551241874695,0.4816531538963318,0.4816531538963318,0.5,2026-08-01 16:51:10

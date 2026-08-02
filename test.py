@@ -15,16 +15,16 @@ from utils.loss import CE_Dice
 
 # ===================== 配置 =====================
 # 模型路径 - 在这里修改你要测试的模型
-MODEL_PATH = 'checkpoints/best_model.pth'  # 修改为你的模型路径
+MODEL_PATH = 'checkpoints/Unet_asc/best_model.pth'  # 修改为你的模型路径
 
 # 数据配置
 BATCH_SIZE = 8
-TEST_TXT = 'test.txt'
+TEST_TXT = 'path/test.txt'
 DATA_DIR = 'data'
-JSON_PATH = 'dataset/s2_norm.json'
-BAND = ['s2']
+JSON_PATH = 'dataset/asc_norm.json'
+BAND = [ 'asc']
 NUM_WORKERS = 4
-OUTPUT_DIR = './test/unet'
+OUTPUT_DIR = './test/normal/asc_unet'
 
 # 模型配置
 MODEL = get_model()

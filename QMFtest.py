@@ -1,5 +1,6 @@
 import os
 import torch
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchmetrics import MetricCollection
@@ -16,16 +17,16 @@ from utils.loss import CE_Dice
 
 # ===================== 配置 =====================
 # 模型路径 - 在这里修改你要测试的模型
-MODEL_PATH = 'checkpoints/best_model.pth'  # 或 'checkpoints/checkpoint-epoch10.pth'
+MODEL_PATH = 'checkpoints/qmf/best_model.pth'  # 或 'checkpoints/checkpoint-epoch10.pth'
 
 # 数据配置
-BATCH_SIZE = 1  # QMF 建议 batch_size=1
-TEST_TXT = 'test.txt'
-DATA_DIR = 'data'
+BATCH_SIZE = 8  # QMF 建议 batch_size=1
+TEST_TXT = 'path/test.txt'
+DATA_DIR = 'miss_all'
 JSON_PATH = 'dataset/norm.json'
 BAND = ['s2', 'asc', 'dsc']  # QMF 需要三个模态
 NUM_WORKERS = 4
-OUTPUT_DIR = './test/qmf_results'
+OUTPUT_DIR = './test/EMM/qmf_results'
 
 # QMF 模型参数（必须与训练时一致）
 CHANNEL_SPLITS = [11, 3, 3]  # s2, asc, dsc 的输入通道数

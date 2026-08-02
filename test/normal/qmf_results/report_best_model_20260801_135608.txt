@@ -1,0 +1,32 @@
+======================================================================
+QMF 模型测试报告
+======================================================================
+Model: best_model
+Model Path: checkpoints/qmf/best_model.pth
+Test Time: 2026-08-01 13:56:08
+Test Samples: 1138
+======================================================================
+
+LOSS:
+  Total Loss: 3.304378
+  Fused Loss: 0.667633
+  Unimodal Loss: 2.636748
+  Reg Loss: 0.000000
+
+SEGMENTATION METRICS:
+  F1 Score: 0.777626
+  IoU: 0.684537
+  Precision: 0.798216
+  Recall: 0.759939
+
+PER MODALITY LOSS:
+  Modality 0: 0.664236
+  Modality 1: 0.993469
+  Modality 2: 0.979040
+
+FUSION WEIGHTS:
+  Modality 0: 0.919909
+  Modality 1: 0.006753
+  Modality 2: 0.073338
+
+======================================================================

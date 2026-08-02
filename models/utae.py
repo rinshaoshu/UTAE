@@ -1,6 +1,6 @@
 """
 Taken from: https://github.com/VSainteuf/utae-paps/tree/main
-Modified to only support tensor input and path
+Modified to only support tensor input and miss_path
 """
 
 import copy
@@ -18,8 +18,8 @@ class UTAE(nn.Module):
         ...     num_classes=1,
         ... )
         >>> x = torch.randn(2, 15, 10, 128, 128)  # [B, T, C, H, W]
-        >>> path = model(x)  # Returns [B, num_classes, H, W]
-        >>> print(path.shape)
+        >>> miss_path = model(x)  # Returns [B, num_classes, H, W]
+        >>> print(miss_path.shape)
         torch.Size([2, 1, 128, 128])
     """
     def __init__(
@@ -44,7 +44,7 @@ class UTAE(nn.Module):
         """
         Args:
             in_channels (int): Number of channels in the input images.
-            num_classes (int): Number of path classes.
+            num_classes (int): Number of miss_path classes.
             encoder_widths (List[int]): Number of channels for each encoder stage.
             decoder_widths (List[int]): Number of channels for each decoder stage.
             str_conv_k (int): Kernel size of strided convolutions.
@@ -669,3 +669,396 @@ class ScaledDotProductAttention(nn.Module):
             return output, attn, comp
         else:
             return output, attn
+#以下是提取的模块
+class LTAE2d(nn.Module):
+    """
+    Lightweight Temporal Attention Encoder for image time series.
+    没有位置编码的版本，适合变化检测等任务。
+
+    Input: [B, T, C, H, W] - 时序特征图
+    Output:
+        - out: [B, C, H, W] - 时序聚合后的特征
+        - attn: [n_heads, B, T, H, W] - 时序注意力权重
+    """
+
+    def __init__(
+            self,
+            in_channels=128,
+            n_head=16,
+            d_k=4,
+            mlp=[256, 128],
+            dropout=0.2,
+            d_model=256,
+            return_att=False,
+    ):
+        """
+        Args:
+            in_channels (int): 输入特征图的通道数
+            n_head (int): 注意力头数
+            d_k (int): 键和查询向量的维度
+            mlp (List[int]): MLP各层宽度
+            dropout (float): dropout比率
+            d_model (int): 投影后的特征维度，如果为None则使用in_channels
+            return_att (bool): 是否返回注意力权重
+        """
+        super(LTAE2d, self).__init__()
+        self.in_channels = in_channels
+        self.mlp = copy.deepcopy(mlp)
+        self.return_att = return_att
+        self.n_head = n_head
+
+        # 可选的特征投影层
+        if d_model is not None:
+            self.d_model = d_model
+            self.inconv = nn.Conv1d(in_channels, d_model, 1)
+        else:
+            self.d_model = in_channels
+            self.inconv = None
+
+        assert self.mlp[0] == self.d_model
+
+        # 注意：没有位置编码器！
+        self.positional_encoder = None
+
+        # 多头注意力
+        self.attention_heads = MultiHeadAttention(
+            n_head=n_head,
+            d_k=d_k,
+            d_in=self.d_model
+        )
+
+        # 归一化层
+        self.in_norm = nn.GroupNorm(
+            num_groups=n_head,
+            num_channels=self.in_channels,
+        )
+        self.out_norm = nn.GroupNorm(
+            num_groups=n_head,
+            num_channels=mlp[-1],
+        )
+
+        # MLP层
+        layers = []
+        for i in range(len(self.mlp) - 1):
+            layers.extend([
+                nn.Linear(self.mlp[i], self.mlp[i + 1]),
+                nn.BatchNorm1d(self.mlp[i + 1]),
+                nn.ReLU(),
+            ])
+        self.mlp = nn.Sequential(*layers)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, pad_mask=None):
+        """
+        Args:
+            x: [B, T, C, H, W] 输入特征图
+            pad_mask: [B, T] 时序padding掩码 (True表示填充位置)
+
+        Returns:
+            out: [B, C, H, W] 时序聚合后的特征
+            attn: [n_heads, B, T, H, W] 注意力权重 (如果return_att=True)
+        """
+        sz_b, seq_len, d, h, w = x.shape
+
+        # 处理padding掩码
+        if pad_mask is not None:
+            pad_mask = (
+                pad_mask.unsqueeze(-1)
+                .repeat((1, 1, h))
+                .unsqueeze(-1)
+                .repeat((1, 1, 1, w))
+            )
+            pad_mask = (
+                pad_mask.permute(0, 2, 3, 1)
+                .contiguous()
+                .view(sz_b * h * w, seq_len)
+            )
+
+        # 重新排列: [B, T, C, H, W] -> [B*H*W, T, C]
+        out = (
+            x.permute(0, 3, 4, 1, 2)
+            .contiguous()
+            .view(sz_b * h * w, seq_len, d)
+        )
+
+        # 输入归一化
+        out = self.in_norm(out.permute(0, 2, 1)).permute(0, 2, 1)
+
+        # 特征投影（可选）
+        if self.inconv is not None:
+            out = self.inconv(out.permute(0, 2, 1)).permute(0, 2, 1)
+
+        # 注意：没有添加位置编码！
+
+        # 多头注意力
+        out, attn = self.attention_heads(out, pad_mask=pad_mask)
+
+        # 聚合多头输出
+        out = (
+            out.permute(1, 0, 2)
+            .contiguous()
+            .view(sz_b * h * w, -1)
+        )
+
+        # MLP处理
+        out = self.dropout(self.mlp(out))
+        out = self.out_norm(out) if self.out_norm is not None else out
+
+        # 恢复空间维度: [B*H*W, C] -> [B, C, H, W]
+        out = out.view(sz_b, h, w, -1).permute(0, 3, 1, 2)
+
+        # 处理注意力权重
+        attn = attn.view(self.n_head, sz_b, h, w, seq_len).permute(
+            0, 1, 4, 2, 3
+        )
+
+        if self.return_att:
+            return out, attn
+        else:
+            return out
+
+
+class MultiHeadAttention(nn.Module):
+    """多头注意力模块"""
+
+    def __init__(self, n_head, d_k, d_in):
+        super().__init__()
+        self.n_head = n_head
+        self.d_k = d_k
+        self.d_in = d_in
+
+        # 可学习的查询向量 (每个头一个)
+        self.Q = nn.Parameter(torch.zeros((n_head, d_k))).requires_grad_(True)
+        nn.init.normal_(self.Q, mean=0, std=np.sqrt(2.0 / (d_k)))
+
+        # 键的线性投影
+        self.fc1_k = nn.Linear(d_in, n_head * d_k)
+        nn.init.normal_(self.fc1_k.weight, mean=0, std=np.sqrt(2.0 / (d_k)))
+
+        # 缩放点积注意力
+        self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5))
+
+    def forward(self, v, pad_mask=None):
+        """
+        Args:
+            v: [B*H*W, T, d_in] 输入序列
+            pad_mask: [B*H*W*T] 或 None
+
+        Returns:
+            output: [n_head, B*H*W, d_in//n_head]
+            attn: [n_head, B*H*W, T]
+        """
+        d_k, d_in, n_head = self.d_k, self.d_in, self.n_head
+        sz_b, seq_len, _ = v.size()
+
+        # 查询: [n_head, d_k] -> [n_head*B*H*W, d_k]
+        q = torch.stack([self.Q for _ in range(sz_b)], dim=1).view(-1, d_k)
+
+        # 键: [B*H*W, T, d_in] -> [n_head*B*H*W, T, d_k]
+        k = self.fc1_k(v).view(sz_b, seq_len, n_head, d_k)
+        k = k.permute(2, 0, 1, 3).contiguous().view(-1, seq_len, d_k)
+
+        # 扩展padding掩码到所有头
+        if pad_mask is not None:
+            pad_mask = pad_mask.repeat((n_head, 1))
+
+        # 值: [B*H*W, T, d_in] -> [n_head*B*H*W, T, d_in//n_head]
+        v = torch.stack(v.split(v.shape[-1] // n_head, dim=-1)).view(
+            n_head * sz_b, seq_len, -1
+        )
+
+        # 缩放点积注意力
+        output, attn = self.attention(q, k, v, pad_mask=pad_mask)
+
+        # 重塑输出: [n_head*B*H*W, T, d_in//n_head] -> [n_head, B*H*W, d_in//n_head]
+        output = output.view(n_head, sz_b, -1, d_in // n_head)
+        output = output.squeeze(dim=2)  # 聚合时间维度
+
+        # 重塑注意力: [n_head*B*H*W, T] -> [n_head, B*H*W, T]
+        attn = attn.view(n_head, sz_b, -1, seq_len)
+        attn = attn.squeeze(dim=2)
+
+        return output, attn
+
+
+class ScaledDotProductAttention(nn.Module):
+    """缩放点积注意力"""
+
+    def __init__(self, temperature, attn_dropout=0.1):
+        super().__init__()
+        self.temperature = temperature
+        self.dropout = nn.Dropout(attn_dropout)
+        self.softmax = nn.Softmax(dim=2)
+
+    def forward(self, q, k, v, pad_mask=None):
+        """
+        Args:
+            q: [n_head*B*H*W, d_k]
+            k: [n_head*B*H*W, T, d_k]
+            v: [n_head*B*H*W, T, d_v]
+            pad_mask: [n_head*B*H*W, T] or None
+
+        Returns:
+            output: [n_head*B*H*W, d_v]
+            attn: [n_head*B*H*W, T]
+        """
+        # 计算注意力分数
+        attn = torch.matmul(q.unsqueeze(1), k.transpose(1, 2))
+        attn = attn / self.temperature
+
+        # 应用padding掩码
+        if pad_mask is not None:
+            attn = attn.masked_fill(pad_mask.unsqueeze(1), -1e3)
+
+        # Softmax
+        attn = self.softmax(attn)
+        attn = self.dropout(attn)
+
+        # 应用注意力权重到值
+        output = torch.matmul(attn, v)
+
+        # 移除时间维度（聚合）
+        output = output.squeeze(dim=1)
+
+        return output, attn
+        """
+Temporal Aggregator - 分组注意力聚合模式（无掩码版本）
+专门用于 att_group 聚合方式，假设所有时间步都有效
+"""
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Temporal_Aggregator(nn.Module):
+    """
+    时序聚合器 - 分组注意力聚合模式（无掩码）
+
+    将带时间维度的特征图 [B, T, C, H, W] 聚合为 [B, C, H, W]
+    使用多头注意力权重进行分组聚合
+
+    Input:
+        x: [B, T, C, H, W] - 时序特征图
+        attn_mask: [n_heads, B, T, H_att, W_att] - 注意力权重 (来自LTAE)
+
+    Output:
+        out: [B, C, H, W] - 聚合后的特征图
+    """
+
+    def __init__(self):
+        super(Temporal_Aggregator, self).__init__()
+
+    def forward(self, x, attn_mask):
+        """
+        Args:
+            x: [B, T, C, H, W] 时序特征图
+            attn_mask: [n_heads, B, T, H_att, W_att] 注意力权重
+
+        Returns:
+            out: [B, C, H, W] 聚合后的特征图
+        """
+        n_heads = attn_mask.shape[0]
+        b, t, c, h, w = x.shape
+        h_att, w_att = attn_mask.shape[-2:]
+
+        # 1. 重塑注意力权重: [n_heads, B, T, H_att, W_att] -> [n_heads*B, T, H_att, W_att]
+        attn = attn_mask.view(n_heads * b, t, h_att, w_att)
+
+        # 2. 空间对齐：上采样或下采样到x的尺寸
+        if h > attn.shape[-2]:  # x更大，需要上采样注意力
+            attn = F.interpolate(
+                attn,
+                size=(h, w),
+                mode='bilinear',
+                align_corners=False
+            )
+        elif h < attn.shape[-2]:  # x更小，需要下采样注意力
+            attn = F.adaptive_avg_pool2d(
+                attn,
+                output_size=(h, w)
+            )
+
+        # 3. 恢复注意力维度: [n_heads*B, T, H, W] -> [n_heads, B, T, H, W]
+        attn = attn.view(n_heads, b, t, h, w)
+
+        # 4. 将特征图按注意力头分组: [B, T, C, H, W] -> [n_heads, B, T, C//n_heads, H, W]
+        # 注意：C必须能被n_heads整除
+        assert c % n_heads == 0, f"Channels {c} must be divisible by n_heads {n_heads}"
+        out = torch.stack(x.chunk(n_heads, dim=2))  # [n_heads, B, T, C//n_heads, H, W]
+
+        # 5. 应用注意力权重: [n_heads, B, T, C//n_heads, H, W] * [n_heads, B, T, 1, H, W]
+        out = attn[:, :, :, None, :, :] * out
+
+        # 6. 在时间维度求和: [n_heads, B, C//n_heads, H, W]
+        out = out.sum(dim=2)  # 聚合时间维度
+
+        # 7. 合并多头输出: [n_heads, B, C//n_heads, H, W] -> [B, C, H, W]
+        out = torch.cat([group for group in out], dim=1)  # 在通道维度拼接
+
+        return out
+
+
+def test_temporal_aggregator():
+    """
+    测试时序聚合器
+    """
+    # 创建测试数据
+    b, t, c, h, w = 2, 5, 64, 32, 32
+    n_heads = 8
+
+    # 创建特征图
+    x = torch.randn(b, t, c, h, w)
+
+    # 创建注意力权重（模拟LTAE的输出）
+    attn_mask = torch.randn(n_heads, b, t, h, w)
+    attn_mask = torch.softmax(attn_mask, dim=2)  # 在时间维度上归一化
+
+    # 创建聚合器
+    aggregator = Temporal_Aggregator()
+
+    # 测试1: 标准情况（相同分辨率）
+    print("测试1: 标准情况（相同分辨率）")
+    out = aggregator(x, attn_mask)
+    print(f"输入特征: {x.shape}")
+    print(f"注意力权重: {attn_mask.shape}")
+    print(f"输出形状: {out.shape}")
+    print(f"期望输出: [{b}, {c}, {h}, {w}]")
+    print()
+
+    # 测试2: 注意力需要上采样
+    print("测试2: 注意力分辨率较低（需要上采样）")
+    h_att, w_att = 16, 16
+    attn_small = torch.randn(n_heads, b, t, h_att, w_att)
+    attn_small = torch.softmax(attn_small, dim=2)
+    out_upsample = aggregator(x, attn_small)
+    print(f"输入特征: {x.shape}")
+    print(f"注意力尺寸: {attn_small.shape}")
+    print(f"输出形状: {out_upsample.shape}")
+    print(f"期望输出: [{b}, {c}, {h}, {w}]")
+    print()
+
+    # 测试3: 注意力需要下采样
+    print("测试3: 注意力分辨率较高（需要下采样）")
+    h_att, w_att = 64, 64
+    attn_large = torch.randn(n_heads, b, t, h_att, w_att)
+    attn_large = torch.softmax(attn_large, dim=2)
+    out_downsample = aggregator(x, attn_large)
+    print(f"输入特征: {x.shape}")
+    print(f"注意力尺寸: {attn_large.shape}")
+    print(f"输出形状: {out_downsample.shape}")
+    print(f"期望输出: [{b}, {c}, {h}, {w}]")
+    print()
+
+    # 验证输出是否正确
+    print("验证: 检查通道数是否正确")
+    expected_c = c
+    actual_c = out.shape[1]
+    print(f"期望通道数: {expected_c}")
+    print(f"实际通道数: {actual_c}")
+    print(f"通道数匹配: {expected_c == actual_c}")
+
+
+if __name__ == "__main__":
+    test_temporal_aggregator()
